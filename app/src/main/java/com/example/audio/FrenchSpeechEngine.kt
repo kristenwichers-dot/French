@@ -58,8 +58,9 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
         tts?.setSpeechRate(rate)
     }
 
-    fun speak(text: String, rate: Float? = null, onComplete: (() -> Unit)? = null) {
+    fun speak(text: String, rate: Float? = null, locale: Locale = Locale.FRENCH, onComplete: (() -> Unit)? = null) {
         val currentRate = rate ?: _speechRate.value
+        tts?.setLanguage(locale)
         tts?.setSpeechRate(currentRate)
 
         if (onComplete != null) {
@@ -73,7 +74,7 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
             })
         }
 
-        val utteranceId = "french_tts_${System.currentTimeMillis()}"
+        val utteranceId = "tts_${System.currentTimeMillis()}"
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
     }
 
@@ -81,7 +82,7 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
         tts?.stop()
     }
 
-    fun startListening(language: String = "fr-FR", onResult: ((String) -> Unit)? = null) {
+    fun startListening(language: String = "auto", onResult: ((String) -> Unit)? = null) {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             Log.w("FrenchSpeechEngine", "Speech recognition not available on this device")
             return
@@ -94,12 +95,19 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
             setRecognitionListener(this@FrenchSpeechEngine)
         }
 
+        val resolvedLang = when {
+            language.equals("auto", ignoreCase = true) -> Locale.getDefault().toLanguageTag()
+            language.startsWith("en", ignoreCase = true) -> "en-US"
+            language.startsWith("fr", ignoreCase = true) -> "fr-FR"
+            else -> language
+        }
+
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, resolvedLang)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, resolvedLang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
         }
 
         try {

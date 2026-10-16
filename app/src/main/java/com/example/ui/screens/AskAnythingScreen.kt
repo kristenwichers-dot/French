@@ -33,13 +33,28 @@ fun AskAnythingScreen(
     val isLoading by viewModel.isChatLoading.collectAsState()
     val translationMode by viewModel.translationMode.collectAsState()
     val showPhonetics by viewModel.showPhonetics.collectAsState()
+    val isListening by viewModel.speechEngine.isListening.collectAsState()
+    val liveTranscript by viewModel.speechEngine.liveTranscript.collectAsState()
 
     var inputPrompt by remember { mutableStateOf("") }
+    var isRecordingForChat by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.size - 1)
+        }
+    }
+
+    LaunchedEffect(liveTranscript) {
+        if (isRecordingForChat && liveTranscript.isNotBlank()) {
+            inputPrompt = liveTranscript
+        }
+    }
+
+    LaunchedEffect(isListening) {
+        if (!isListening && isRecordingForChat) {
+            isRecordingForChat = false
         }
     }
 
@@ -119,6 +134,35 @@ fun AskAnythingScreen(
             }
         }
 
+        // Voice to Text Active Listening Indicator
+        if (isRecordingForChat && isListening) {
+            Surface(
+                color = MaterialTheme.colorScheme.primaryContainer,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        Icons.Default.GraphicEq,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Listening... Speak your question in English or French",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
+            }
+        }
+
         // French Accent Helper Keyboard
         AccentKeyboardRow(
             onAccentClick = { char -> inputPrompt += char }
@@ -141,7 +185,39 @@ fun AskAnythingScreen(
                     .testTag("chat_input_field"),
                 maxLines = 3
             )
-            Spacer(modifier = Modifier.width(8.dp))
+
+            Spacer(modifier = Modifier.width(6.dp))
+
+            // Voice to Text Microphone Button
+            IconButton(
+                onClick = {
+                    if (isListening && isRecordingForChat) {
+                        viewModel.speechEngine.stopListening()
+                        isRecordingForChat = false
+                    } else {
+                        isRecordingForChat = true
+                        viewModel.speechEngine.startListening("auto") { spoken ->
+                            inputPrompt = spoken
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(
+                        if (isRecordingForChat && isListening) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.primaryContainer
+                    )
+                    .testTag("voice_to_text_question_btn")
+            ) {
+                Icon(
+                    imageVector = if (isRecordingForChat && isListening) Icons.Default.GraphicEq else Icons.Default.Mic,
+                    contentDescription = "Voice to text question",
+                    tint = if (isRecordingForChat && isListening) Color.White else MaterialTheme.colorScheme.primary
+                )
+            }
+
+            Spacer(modifier = Modifier.width(6.dp))
+
             IconButton(
                 onClick = {
                     if (inputPrompt.isNotBlank()) {

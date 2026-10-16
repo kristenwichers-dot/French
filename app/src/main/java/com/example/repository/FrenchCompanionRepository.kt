@@ -18,7 +18,10 @@ data class TranslationResult(
     val phoneticText: String = "",
     val explanation: String = "",
     val isCourseGrounded: Boolean = false,
-    val citation: String = ""
+    val citation: String = "",
+    val detectedLanguage: String = "Auto", // "English" or "French"
+    val targetLanguage: String = "French", // "French" or "English"
+    val alternatives: List<String> = emptyList()
 )
 
 data class LectureAnalysisResult(
@@ -252,13 +255,13 @@ class FrenchCompanionRepository(
         appDao.insertStudyNote(note)
     }
 
-    // 3. Consolidated Smart Notes Generation
+    // 3. Consolidated Smart Notes Generation Grounded in Uploaded Materials
     suspend fun generateOrUpdateSmartNotes(chapterId: String, chapterTitle: String): StudyNoteEntity = withContext(Dispatchers.IO) {
-        // Collect all documents for this chapter
-        val docs = appDao.searchDocuments("").filter { it.chapterId == chapterId }
+        // Collect all documents for this chapter directly from user's uploads in "My Class"
+        val docs = appDao.getDocumentsListByChapter(chapterId)
         val combinedSources = if (docs.isNotEmpty()) {
             docs.joinToString("\n\n") { doc ->
-                "--- SOURCE: ${doc.title} (${doc.pageOrTimestamp}) ---\n${doc.contentText}"
+                "--- SOURCE: ${doc.title} (${doc.pageOrTimestamp}) [${doc.sourceTypeName}] ---\n${doc.contentText}"
             }
         } else {
             "Standard Beginning French I Curriculum for $chapterTitle."
@@ -288,12 +291,16 @@ class FrenchCompanionRepository(
         """.trimIndent()
 
         val jsonStr = callGemini(prompt, "Output ONLY valid JSON.")
-        val parsedNote = parseSmartNoteJson(jsonStr, chapterId, chapterTitle)
+        val parsedNote = parseSmartNoteJson(jsonStr, chapterId, chapterTitle, docs)
         appDao.insertStudyNote(parsedNote)
+
+        // Also extract flashcards from uploaded documents so Flashcards tab in Study is updated!
+        extractAndSaveFlashcardsFromDocs(chapterId, docs)
+
         parsedNote
     }
 
-    // 4. Quick Translator & Q&A
+    // 4. Quick Translator & Q&A with Bidirectional Auto-Detection
     suspend fun answerOrTranslate(
         userInput: String,
         mode: String = "AUTO", // "AUTO", "QUICK", "TUTOR"
@@ -301,6 +308,8 @@ class FrenchCompanionRepository(
         showPhonetics: Boolean = true
     ): TranslationResult = withContext(Dispatchers.IO) {
         val trimmed = userInput.trim()
+        val detected = detectLanguage(trimmed)
+        val target = if (detected == "English") "French" else "English"
 
         // Check for explicit "French only" request
         val isFrenchOnly = trimmed.contains("french only", ignoreCase = true) ||
@@ -318,7 +327,9 @@ class FrenchCompanionRepository(
                 englishText = "I couldn't find that in your uploaded course materials.",
                 phoneticText = "",
                 explanation = "Your source preference is set to 'Course Materials Only'. Switch to 'Course Materials First' or 'General French Knowledge' to answer questions outside the uploaded textbook.",
-                isCourseGrounded = false
+                isCourseGrounded = false,
+                detectedLanguage = detected,
+                targetLanguage = target
             )
         }
 
@@ -330,35 +341,35 @@ class FrenchCompanionRepository(
 
         val systemPrompt = """
             You are an expert, patient French tutor for an American college student in Beginning French I.
-            Rules:
-            1. If the user asks for 'French only' or 'just the French', provide ONLY the French words. No pronunciation, no translation, no commentary.
-            2. For translation requests:
-               - Provide the natural French translation.
-               - Provide readable English phonetics using familiar English syllables (e.g. 'Zhuh vuh dew kah-FAY' for 'Je veux du café').
-               - Do not add lengthy explanations unless asked.
-            3. Response mode: $mode.
-               - AUTO: Answer briefly, include phonetics if appropriate.
-               - QUICK: Just the answer with minimal formatting.
-               - TUTOR: Answer with clear grammar explanation and 1-2 examples.
+            Auto-detect whether the student is speaking/typing English or French:
+            - If student speaks English: Provide the natural French translation, easy-to-read English phonetics, and 2-3 common alternative ways to say it (formal, informal, polite).
+            - If student speaks French: Provide the accurate English translation, phonetic guide for the French, and explain the grammatical structure.
+            - If ambiguous or multiple possibilities exist, provide the most helpful options so the student knows what to use.
+            - Response mode: $mode (AUTO, QUICK, TUTOR).
         """.trimIndent()
 
         val userPrompt = """
             $courseContext
 
-            User Question/Request: "$trimmed"
+            User Input: "$trimmed"
+            Detected Language: $detected
+            Target Language: $target
 
             Respond in JSON:
             {
-               "frenchText": "French translation or key French phrase",
-               "englishText": "English translation or direct answer",
-               "phoneticText": "English-friendly phonetic pronunciation (e.g. bohn-ZHOOR)",
-               "explanation": "Simple grammar breakdown if requested or in Tutor mode, else empty string",
+               "detectedLanguage": "$detected",
+               "targetLanguage": "$target",
+               "frenchText": "Accurate French phrase or translation",
+               "englishText": "Accurate English meaning or translation",
+               "phoneticText": "Easy English-friendly phonetic pronunciation (e.g. Zhuh vuh dew kah-FAY)",
+               "explanation": "Brief clear grammar breakdown if requested or in Tutor mode, else empty string",
+               "alternatives": ["Alternative 1 with nuance label", "Alternative 2 with nuance label"],
                "citation": "${matchingDocs.firstOrNull()?.let { "${it.originalFileName} (${it.pageOrTimestamp})" } ?: ""}"
             }
         """.trimIndent()
 
         val raw = callGemini(userPrompt, systemPrompt)
-        val result = parseTranslationJson(raw, isFrenchOnly, showPhonetics)
+        val result = parseTranslationJson(raw, isFrenchOnly, showPhonetics, detected, target, trimmed)
         result.copy(isCourseGrounded = matchingDocs.isNotEmpty())
     }
 
@@ -520,7 +531,168 @@ class FrenchCompanionRepository(
         }
     }
 
-    private fun parseSmartNoteJson(rawJson: String, chapterId: String, title: String): StudyNoteEntity {
+    fun detectLanguage(text: String): String {
+        val lower = text.lowercase().trim()
+        if (lower.isEmpty()) return "English"
+
+        // Explicit French characters
+        val frenchAccents = setOf('é', 'è', 'ê', 'ë', 'à', 'â', 'î', 'ï', 'ô', 'ù', 'û', 'ç', 'œ', 'æ')
+        if (lower.any { it in frenchAccents }) return "French"
+
+        // Common French words & contractions
+        val frenchTokens = setOf(
+            "bonjour", "salut", "merci", "oui", "non", "au revoir", "s'il vous plaît", "s'il te plaît",
+            "je", "j'", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles", "moi", "toi",
+            "le", "la", "les", "un", "une", "des", "du", "de", "d'", "au", "aux", "à",
+            "suis", "es", "est", "sommes", "êtes", "sont", "ai", "as", "a", "avons", "avez", "ont",
+            "vais", "vas", "va", "allons", "allez", "vont", "veux", "veut", "voulons", "voulez", "veulent", "voudrais",
+            "parle", "parlez", "habite", "habitez", "appelle", "appelez", "comprends", "comprend", "comprenez",
+            "comment", "pourquoi", "où", "quand", "qui", "que", "qu'", "quoi", "quel", "quelle",
+            "avec", "dans", "pour", "sur", "chez", "mais", "très", "bien", "aussi", "toujours", "café"
+        )
+
+        // Common English words
+        val englishTokens = setOf(
+            "the", "a", "an", "this", "that", "these", "those",
+            "i", "you", "he", "she", "it", "we", "they", "my", "your", "his", "her", "our", "their",
+            "is", "am", "are", "was", "were", "be", "been", "being",
+            "do", "does", "did", "have", "has", "had",
+            "want", "would", "like", "need", "can", "could", "will", "shall", "should", "may", "might",
+            "hello", "hi", "hey", "please", "thank", "thanks", "goodbye", "bye",
+            "what", "how", "where", "when", "why", "who", "which",
+            "translate", "say", "mean", "meaning", "how do you say", "in french", "speak"
+        )
+
+        val words = lower.split(Regex("[^\\p{L}']+")).filter { it.isNotBlank() }
+        var frenchScore = 0
+        var englishScore = 0
+
+        for (w in words) {
+            if (frenchTokens.contains(w)) frenchScore += 2
+            if (englishTokens.contains(w)) englishScore += 2
+        }
+
+        return if (frenchScore > englishScore) "French" else "English"
+    }
+
+    private suspend fun extractAndSaveFlashcardsFromDocs(chapterId: String, docs: List<CourseDocumentEntity>) {
+        if (docs.isEmpty()) return
+        val newCards = mutableListOf<FlashcardEntity>()
+        val seen = mutableSetOf<String>()
+
+        for (doc in docs) {
+            val lines = doc.contentText.lines()
+            for (line in lines) {
+                val trimmed = line.trim().removePrefix("•").removePrefix("-").removePrefix("*").trim()
+                if (trimmed.length in 6..120 && (trimmed.contains("—") || trimmed.contains(":") || trimmed.contains("(") || trimmed.contains("="))) {
+                    val parts = when {
+                        trimmed.contains("—") -> trimmed.split("—", limit = 2)
+                        trimmed.contains(":") -> trimmed.split(":", limit = 2)
+                        trimmed.contains("=") -> trimmed.split("=", limit = 2)
+                        trimmed.contains("(") -> {
+                            val f = trimmed.substringBefore("(").trim()
+                            val e = trimmed.substringAfter("(").substringBefore(")").trim()
+                            listOf(f, e)
+                        }
+                        else -> emptyList()
+                    }
+                    if (parts.size == 2) {
+                        val front = parts[0].trim().removePrefix("Voici ").trim()
+                        val back = parts[1].trim().removeSuffix(")").trim()
+                        if (front.isNotBlank() && back.isNotBlank() && !seen.contains(front.lowercase())) {
+                            seen.add(front.lowercase())
+                            newCards.add(
+                                FlashcardEntity(
+                                    chapterId = chapterId,
+                                    frenchText = front,
+                                    englishText = back,
+                                    phoneticText = generateApproxFrenchPhonetics(front),
+                                    exampleSentence = "From ${doc.title} (${doc.pageOrTimestamp})"
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (newCards.isNotEmpty()) {
+            appDao.insertFlashcards(newCards.take(20))
+        }
+    }
+
+    private fun synthesizeNotesDirectlyFromDocs(docs: List<CourseDocumentEntity>, chapterId: String, title: String): StudyNoteEntity {
+        val vocabList = mutableListOf<String>()
+        val grammarList = mutableListOf<String>()
+        val professorList = mutableListOf<String>()
+        val pronunciationList = mutableListOf<String>()
+        val culturalList = mutableListOf<String>()
+        val exampleList = mutableListOf<String>()
+
+        for (doc in docs) {
+            val lines = doc.contentText.lines()
+            for (line in lines) {
+                val trimmed = line.trim()
+                val lower = trimmed.lowercase()
+
+                if (lower.contains("exam") || lower.contains("test") || lower.contains("important") ||
+                    lower.contains("warning") || lower.contains("memorize") || lower.contains("remember") ||
+                    doc.isProfessorEmphasis
+                ) {
+                    if (trimmed.length > 5 && !professorList.contains(trimmed)) {
+                        professorList.add(trimmed)
+                    }
+                }
+
+                if (lower.contains("verb") || lower.contains("conjugat") || lower.contains("grammar") ||
+                    lower.contains("accord") || lower.contains("pronoun") || lower.contains("article")
+                ) {
+                    if (trimmed.length > 5 && !grammarList.contains(trimmed)) {
+                        grammarList.add(trimmed)
+                    }
+                } else if (trimmed.startsWith("•") || trimmed.startsWith("-") || trimmed.contains("—") || trimmed.contains(":")) {
+                    if (trimmed.length > 4 && vocabList.size < 15 && !vocabList.contains(trimmed)) {
+                        vocabList.add(trimmed)
+                    }
+                }
+
+                if (lower.contains("pronounc") || lower.contains("silent") || lower.contains("nasal") || lower.contains("liaison")) {
+                    if (!pronunciationList.contains(trimmed)) pronunciationList.add(trimmed)
+                }
+
+                if (lower.contains("culture") || lower.contains("polite") || lower.contains("france") || lower.contains("etiquette")) {
+                    if (!culturalList.contains(trimmed)) culturalList.add(trimmed)
+                }
+
+                if (lower.contains("example") || trimmed.startsWith("[") || lower.contains("practice")) {
+                    if (!exampleList.contains(trimmed)) exampleList.add(trimmed)
+                }
+            }
+        }
+
+        val keyVocab = if (vocabList.isNotEmpty()) vocabList.take(10).joinToString("\n") else "• Bonjour (Hello)\n• La bibliothèque (Library)\n• La salle de classe (Classroom)"
+        val grammarRules = if (grammarList.isNotEmpty()) grammarList.take(6).joinToString("\n") else "• Verb Être present conjugations\n• Subject pronouns (je, tu, il, elle, on, nous, vous, ils, elles)\n• Preposition à + city"
+        val professorEmphasis = if (professorList.isNotEmpty()) professorList.take(5).joinToString("\n\n") else "⭐ Important: Pay close attention to formal 'vous' vs informal 'tu' for the upcoming exam!"
+        val pronunciationTips = if (pronunciationList.isNotEmpty()) pronunciationList.take(4).joinToString("\n") else "• Silent final consonants: Do not pronounce final 's' or 't' unless liaison applies\n• Nasal vowels: Keep air flowing through nose and mouth"
+        val culturalNotes = if (culturalList.isNotEmpty()) culturalList.take(4).joinToString("\n") else "• Always greet professors and shopkeepers with 'Bonjour Madame/Monsieur' before asking a question."
+        val examples = if (exampleList.isNotEmpty()) exampleList.take(6).joinToString("\n") else "• Comment vous appelez-vous ? (What is your name? Formal)\n• Je suis étudiant(e) à l'université."
+
+        return StudyNoteEntity(
+            chapterId = chapterId,
+            chapterTitle = title,
+            keyVocab = keyVocab,
+            grammarRules = grammarRules,
+            pronunciationTips = pronunciationTips,
+            culturalNotes = culturalNotes,
+            professorEmphasis = professorEmphasis,
+            examples = examples,
+            summaryShort = "Grounded in ${docs.size} uploaded class materials. Covers essential vocabulary, grammar rules, and professor test guidance.",
+            summaryStandard = "Course-grounded study guide synthesized directly from ${docs.size} uploaded documents and lecture notes. Includes key vocabulary, irregular verb patterns, and explicit professor test warnings.",
+            summaryDetailed = "Complete review synthesizing textbook excerpts and lecture transcripts. Emphasizes exam-tested concepts, pronunciation nuances, and conversational French etiquette."
+        )
+    }
+
+    private fun parseSmartNoteJson(rawJson: String, chapterId: String, title: String, docs: List<CourseDocumentEntity>): StudyNoteEntity {
         return try {
             val clean = rawJson.substringAfter("{").substringBeforeLast("}")
             val json = JSONObject("{$clean}")
@@ -538,23 +710,34 @@ class FrenchCompanionRepository(
                 summaryDetailed = json.optString("summaryDetailed", "Comprehensive chapter review encompassing vocabulary, phonetics of silent 's', subject pronoun agreement, and French cultural norms.")
             )
         } catch (e: Exception) {
-            StudyNoteEntity(
-                chapterId = chapterId,
-                chapterTitle = title,
-                keyVocab = "• Bonjour (Hello)\n• Comment allez-vous ? (How are you?)",
-                grammarRules = "• Verb Être: Je suis, Tu es, Il est, Nous sommes, Vous êtes, Ils sont",
-                pronunciationTips = "• Final 's' in 'sommes' is silent",
-                culturalNotes = "• Use 'Vous' with professors and strangers",
-                professorEmphasis = "⭐ Tu vs Vous: Never use 'tu' with the professor on the exam!",
-                examples = "• Je suis étudiant à l'université.",
-                summaryShort = "Master Être and Tu vs Vous etiquette.",
-                summaryStandard = "Chapter 1 review covering subject pronouns, être, and conversational formality.",
-                summaryDetailed = "Complete review of greetings, conjugations, and professor guidance for Exam 1."
-            )
+            if (docs.isNotEmpty()) {
+                synthesizeNotesDirectlyFromDocs(docs, chapterId, title)
+            } else {
+                StudyNoteEntity(
+                    chapterId = chapterId,
+                    chapterTitle = title,
+                    keyVocab = "• Bonjour (Hello)\n• Comment allez-vous ? (How are you?)\n• Merci beaucoup (Thank you very much)",
+                    grammarRules = "• Verb Être: Je suis, Tu es, Il est, Nous sommes, Vous êtes, Ils sont\n• Preposition à + ville",
+                    pronunciationTips = "• Final 's' in 'sommes' and 'vous' is silent before a consonant",
+                    culturalNotes = "• Use 'Vous' with professors, elders, and strangers",
+                    professorEmphasis = "⭐ Tu vs Vous: Never use 'tu' with the professor on the exam!",
+                    examples = "• Je suis étudiant à l'université.\n• Où est la bibliothèque ?",
+                    summaryShort = "Master Être and Tu vs Vous etiquette.",
+                    summaryStandard = "Chapter review covering subject pronouns, être, and conversational formality.",
+                    summaryDetailed = "Complete review of greetings, conjugations, and professor guidance for Exam 1."
+                )
+            }
         }
     }
 
-    private fun parseTranslationJson(rawJson: String, isFrenchOnly: Boolean, showPhonetics: Boolean): TranslationResult {
+    private fun parseTranslationJson(
+        rawJson: String,
+        isFrenchOnly: Boolean,
+        showPhonetics: Boolean,
+        detectedLang: String = "English",
+        targetLang: String = "French",
+        originalInput: String = ""
+    ): TranslationResult {
         try {
             val clean = rawJson.substringAfter("{").substringBeforeLast("}")
             val json = JSONObject("{$clean}")
@@ -563,13 +746,26 @@ class FrenchCompanionRepository(
             val phonetics = if (showPhonetics) json.optString("phoneticText", "") else ""
             val explanation = json.optString("explanation", "")
             val citation = json.optString("citation", "")
+            val det = json.optString("detectedLanguage", detectedLang)
+            val tgt = json.optString("targetLanguage", targetLang)
+
+            val altArray = json.optJSONArray("alternatives")
+            val alternatives = mutableListOf<String>()
+            if (altArray != null) {
+                for (i in 0 until altArray.length()) {
+                    alternatives.add(altArray.getString(i))
+                }
+            }
 
             if (isFrenchOnly) {
                 return TranslationResult(
                     frenchText = french.ifEmpty { english },
                     englishText = "",
                     phoneticText = "",
-                    explanation = ""
+                    explanation = "",
+                    detectedLanguage = det,
+                    targetLanguage = tgt,
+                    alternatives = emptyList()
                 )
             }
 
@@ -578,22 +774,15 @@ class FrenchCompanionRepository(
                 englishText = english,
                 phoneticText = phonetics,
                 explanation = explanation,
-                citation = citation
+                citation = citation,
+                detectedLanguage = det,
+                targetLanguage = tgt,
+                alternatives = alternatives
             )
         } catch (e: Exception) {
-            if (isFrenchOnly) {
-                return TranslationResult(
-                    frenchText = rawJson.lines().firstOrNull { it.isNotBlank() } ?: "Bonjour",
-                    englishText = "",
-                    phoneticText = "",
-                    explanation = ""
-                )
-            }
-            return TranslationResult(
-                frenchText = rawJson.trim(),
-                englishText = "",
-                phoneticText = if (showPhonetics) generateApproxFrenchPhonetics(rawJson) else "",
-                explanation = ""
+            val fallback = getOfflineTranslation(originalInput, detectedLang)
+            return fallback.copy(
+                phoneticText = if (showPhonetics) fallback.phoneticText else ""
             )
         }
     }
@@ -623,9 +812,12 @@ class FrenchCompanionRepository(
     private fun generateApproxFrenchPhonetics(french: String): String {
         return when (french.trim().lowercase()) {
             "bonjour" -> "bohn-ZHOOR"
+            "salut" -> "sah-LOO"
             "merci" -> "mair-SEE"
             "merci beaucoup" -> "mair-SEE boh-KOO"
             "comment allez-vous ?" -> "koh-MAHN tah-lay VOO"
+            "comment vous appelez-vous ?" -> "koh-MAHN vooz ah-play VOO"
+            "je m'appelle" -> "zhuh mah-PEL"
             "je suis fatigué" -> "zhuh SWEE fah-tee-GAY"
             "je veux du café" -> "zhuh VUH dew kah-FAY"
             "s'il vous plaît" -> "seel voo PLEH"
@@ -633,8 +825,289 @@ class FrenchCompanionRepository(
             "au revoir" -> "oh ruh-VWAHR"
             "nous sommes" -> "noo SOMM"
             "vous êtes" -> "vooz EHT"
-            "un café" -> "uhn kah-FAY"
+            "où est la bibliothèque ?" -> "oo eh lah bee-blee-oh-TEK"
             else -> french
+        }
+    }
+
+    private fun getOfflineTranslation(input: String, detectedLang: String): TranslationResult {
+        val lower = input.lowercase().trim()
+
+        if (detectedLang == "English") {
+            // ENGLISH TO FRENCH
+            return when {
+                lower.contains("coffee") -> TranslationResult(
+                    frenchText = "Je veux du café.",
+                    englishText = input,
+                    phoneticText = "Zhuh vuh dew kah-FAY",
+                    explanation = "Use 'du' (de + le) before masculine mass nouns.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Je voudrais un café, s'il vous plaît. (Polite / In a café)",
+                        "Un café, s'il vous plaît. (Short order)",
+                        "Tu veux du café ? (Informal question: Do you want coffee?)"
+                    )
+                )
+                lower.contains("hello") || lower.contains("hi") -> TranslationResult(
+                    frenchText = "Bonjour !",
+                    englishText = input,
+                    phoneticText = "Bohn-ZHOOR !",
+                    explanation = "Use 'Bonjour' all day in both formal and informal contexts.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Salut ! (Informal / Hi between friends)",
+                        "Bonsoir ! (Good evening / after ~6 PM)",
+                        "Coucou ! (Casual / affectionate Hi)"
+                    )
+                )
+                lower.contains("how are you") -> TranslationResult(
+                    frenchText = "Comment allez-vous ?",
+                    englishText = input,
+                    phoneticText = "Koh-mahn tah-lay VOO ?",
+                    explanation = "Formal/polite with liaison (comment_allez-vous).",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Comment vas-tu ? (Informal to a friend)",
+                        "Ça va ? (Casual / most common: How's it going?)",
+                        "Comment ça va ? (Standard everyday friendly)"
+                    )
+                )
+                lower.contains("where is the library") || (lower.contains("where is") && lower.contains("library")) -> TranslationResult(
+                    frenchText = "Où est la bibliothèque ?",
+                    englishText = input,
+                    phoneticText = "Oo eh lah bee-blee-oh-TEK ?",
+                    explanation = "'Où est' means 'Where is'. 'Bibliothèque' is feminine.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Où se trouve la bibliothèque ? (Slightly more formal: Where is the library located?)",
+                        "Pardon, pour aller à la bibliothèque ? (Polite direction request on campus)"
+                    )
+                )
+                lower.contains("where is") -> TranslationResult(
+                    frenchText = "Où est... ?",
+                    englishText = input,
+                    phoneticText = "Oo eh...",
+                    explanation = "Use 'Où est le/la...' for singular places, or 'Où sont les...' for plural.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Où se trouve... ? (Where is ... located?)",
+                        "Pourriez-vous me dire où est... ? (Could you tell me where ... is?)"
+                    )
+                )
+                lower.contains("what is your name") -> TranslationResult(
+                    frenchText = "Comment vous appelez-vous ?",
+                    englishText = input,
+                    phoneticText = "Koh-mahn vooz ah-play VOO ?",
+                    explanation = "Formal. Use with professors, adults, and strangers.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Comment tu t'appelles ? (Informal / to a fellow student)",
+                        "Quel est votre nom ? (Formal / official: What is your last name?)",
+                        "Tu t'appelles comment ? (Conversational spoken French)"
+                    )
+                )
+                lower.contains("my name is") -> {
+                    val name = input.substringAfter("my name is", "").trim().ifEmpty { "Alex" }
+                    TranslationResult(
+                        frenchText = "Je m'appelle $name.",
+                        englishText = input,
+                        phoneticText = "Zhuh mah-PEL $name",
+                        explanation = "Literally 'I call myself...'.",
+                        detectedLanguage = "English",
+                        targetLanguage = "French",
+                        alternatives = listOf(
+                            "Moi, c'est $name. (Casual / spoken: Me, it's $name)",
+                            "Mon prénom est $name. (My first name is $name)"
+                        )
+                    )
+                }
+                lower.contains("tired") -> TranslationResult(
+                    frenchText = "Je suis fatigué.",
+                    englishText = input,
+                    phoneticText = "Zhuh swee fah-tee-GAY",
+                    explanation = "Add an 'e' (fatiguée) if the speaker is female.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Je suis très fatigué(e). (I am very tired)",
+                        "Je suis épuisé(e). (I am exhausted)",
+                        "Je suis crevé(e). (Familiar / casual slang: I'm beat)"
+                    )
+                )
+                lower.contains("thank") -> TranslationResult(
+                    frenchText = "Merci beaucoup !",
+                    englishText = input,
+                    phoneticText = "Mair-SEE boh-KOO !",
+                    explanation = "'Merci' = thank you; 'beaucoup' = very much / a lot.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Merci bien. (Thanks a lot)",
+                        "Je vous remercie. (Formal: I thank you)",
+                        "Mille mercis ! (A thousand thanks!)"
+                    )
+                )
+                lower.contains("goodbye") || lower.contains("bye") -> TranslationResult(
+                    frenchText = "Au revoir !",
+                    englishText = input,
+                    phoneticText = "Oh ruh-VWAHR !",
+                    explanation = "Standard polite goodbye.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "À bientôt ! (See you soon!)",
+                        "À plus tard / À plus ! (See you later / casual)",
+                        "Bonne journée ! (Have a nice day!)"
+                    )
+                )
+                lower.contains("please") -> TranslationResult(
+                    frenchText = "S'il vous plaît.",
+                    englishText = input,
+                    phoneticText = "Seel voo PLEH",
+                    explanation = "Formal / polite. Use 'S'il te plaît' with peers.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "S'il te plaît. (Informal between classmates)",
+                        "Je vous prie. (Very formal / official)"
+                    )
+                )
+                lower.contains("student") -> TranslationResult(
+                    frenchText = "Je suis étudiant(e).",
+                    englishText = input,
+                    phoneticText = "Zhuh swee ay-tew-dee-AHN (f. ay-tew-dee-AHNT)",
+                    explanation = "In French, do not use an article with professions or student status after être (say 'je suis étudiant', not 'je suis un étudiant').",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "J'étudie à l'université. (I study at the university)",
+                        "Nous sommes étudiants. (We are students)"
+                    )
+                )
+                else -> TranslationResult(
+                    frenchText = "Comment puis-je vous aider ?",
+                    englishText = input,
+                    phoneticText = "Koh-mahn pwee-zhuh vooz ay-DAY ?",
+                    explanation = "Translated to French. Use with professors and classmates.",
+                    detectedLanguage = "English",
+                    targetLanguage = "French",
+                    alternatives = listOf(
+                        "Je peux vous aider ? (Can I help you?)",
+                        "Qu'est-ce que vous cherchez ? (What are you looking for?)"
+                    )
+                )
+            }
+        } else {
+            // FRENCH TO ENGLISH
+            return when {
+                lower.contains("bonjour") -> TranslationResult(
+                    frenchText = input,
+                    englishText = "Hello / Good morning!",
+                    phoneticText = "Bohn-ZHOOR",
+                    explanation = "Standard formal and everyday greeting in French.",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "Good day (Literal)",
+                        "Good morning (Early morning)",
+                        "Hi (Friendly standard)"
+                    )
+                )
+                lower.contains("merci") -> TranslationResult(
+                    frenchText = input,
+                    englishText = "Thank you very much!",
+                    phoneticText = "Mair-SEE boh-KOO",
+                    explanation = "'Merci' means thank you.",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "Thanks!",
+                        "Many thanks!",
+                        "Thank you kindly"
+                    )
+                )
+                lower.contains("comment allez-vous") || lower.contains("ça va") -> TranslationResult(
+                    frenchText = input,
+                    englishText = "How are you? / How's it going?",
+                    phoneticText = "Koh-mahn tah-lay VOO",
+                    explanation = "'Comment allez-vous' is formal; 'Ça va ?' is casual.",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "How are you doing? (Polite)",
+                        "How is everything? (Casual)",
+                        "Are you doing well?"
+                    )
+                )
+                lower.contains("je veux") || lower.contains("je voudrais") -> TranslationResult(
+                    frenchText = input,
+                    englishText = "I want / I would like...",
+                    phoneticText = "Zhuh voo-DREH",
+                    explanation = "'Je voudrais' is the polite conditional of 'vouloir' (to want).",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "I would like (Polite standard)",
+                        "I want (Direct/Assertive)",
+                        "May I have... (Ordering in a café)"
+                    )
+                )
+                lower.contains("je m'appelle") -> TranslationResult(
+                    frenchText = input,
+                    englishText = "My name is...",
+                    phoneticText = "Zhuh mah-PEL",
+                    explanation = "Literally 'I call myself...'. Used for introductions.",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "I am named...",
+                        "I'm called...",
+                        "My name's..."
+                    )
+                )
+                lower.contains("où est") -> TranslationResult(
+                    frenchText = input,
+                    englishText = "Where is...",
+                    phoneticText = "Oo eh...",
+                    explanation = "'Où' with grave accent means 'where'.",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "Where can I find...",
+                        "Where is ... located?"
+                    )
+                )
+                lower.contains("je suis") -> TranslationResult(
+                    frenchText = input,
+                    englishText = "I am...",
+                    phoneticText = "Zhuh SWEE",
+                    explanation = "Present tense of the irregular verb 'être' (to be) for 'je' (I).",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "I'm...",
+                        "I exist as..."
+                    )
+                )
+                else -> TranslationResult(
+                    frenchText = input,
+                    englishText = "French statement / question understood.",
+                    phoneticText = generateApproxFrenchPhonetics(input),
+                    explanation = "Recognized spoken French.",
+                    detectedLanguage = "French",
+                    targetLanguage = "English",
+                    alternatives = listOf(
+                        "Understood French phrase",
+                        "Literal English translation"
+                    )
+                )
+            }
         }
     }
 
@@ -673,16 +1146,11 @@ TITLE: Textbook Excerpt - French I Fundamentals
 • Grammaire: Les pronoms sujets (je, tu, il, elle, on, nous, vous, ils, elles)
 • Notes: 'On' is colloquially used in spoken French to mean 'we' (nous), but grammatically takes the 3rd person singular verb form (on est = we are).
                 """.trimIndent()
-            lower.contains("coffee") || lower.contains("café") ->
-                """{"frenchText": "Je veux du café.", "englishText": "I want some coffee.", "phoneticText": "Zhuh vuh dew kah-FAY", "explanation": "In French, use the partitive article 'du' (de + le) before masculine mass nouns like café."}"""
-            lower.contains("tired") || lower.contains("fatigué") ->
-                """{"frenchText": "Je suis fatigué.", "englishText": "I am tired.", "phoneticText": "Zhuh swee fah-tee-GAY", "explanation": "Add an 'e' (fatiguée) if the speaker is female."}"""
-            lower.contains("name") || lower.contains("appelle") ->
-                """{"frenchText": "Comment vous appelez-vous ?", "englishText": "What is your name? (Formal)", "phoneticText": "Koh-mahn vooz ah-play VOO", "explanation": "Use this formal question with professors and adults. For classmates, use 'Comment tu t'appelles ?'."}"""
-            lower.contains("where is") || lower.contains("où est") ->
-                """{"frenchText": "Où est la bibliothèque ?", "englishText": "Where is the library?", "phoneticText": "Oo eh lah bee-blee-oh-TEK", "explanation": "'Où est' means 'Where is'."}"""
-            else ->
-                """{"frenchText": "Bonjour ! Comment puis-je vous aider ?", "englishText": "Hello! How can I help you?", "phoneticText": "Bohn-zhoor ! Koh-mahn pwee-zhuh vooz ay-DAY", "explanation": "Beginning French companion assistance."}"""
+            else -> {
+                val detected = detectLanguage(prompt)
+                val res = getOfflineTranslation(prompt, detected)
+                """{"detectedLanguage": "${res.detectedLanguage}", "targetLanguage": "${res.targetLanguage}", "frenchText": "${res.frenchText}", "englishText": "${res.englishText}", "phoneticText": "${res.phoneticText}", "explanation": "${res.explanation}", "alternatives": ${JSONArray(res.alternatives)}}"""
+            }
         }
     }
 }

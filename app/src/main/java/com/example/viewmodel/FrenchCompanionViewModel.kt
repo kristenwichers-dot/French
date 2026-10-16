@@ -21,8 +21,15 @@ enum class Screen {
 
 data class LiveTranscriptItem(
     val id: Long = System.currentTimeMillis(),
-    val french: String,
-    val english: String,
+    val spokenText: String = "",
+    val translatedText: String = "",
+    val spokenLang: String = "English",
+    val targetLang: String = "French",
+    val french: String = "",
+    val english: String = "",
+    val phonetics: String = "",
+    val alternatives: List<String> = emptyList(),
+    val explanation: String = "",
     val timestamp: String = "Just now"
 )
 
@@ -229,10 +236,15 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
         _liveMode.value = mode
     }
 
-    fun startLiveListening() {
-        speechEngine.startListening("fr-FR") { frenchHeard ->
-            if (frenchHeard.isNotBlank()) {
-                handleLiveSpeech(frenchHeard)
+    fun startLiveListening(languageDirection: String = "AUTO") {
+        val speechLang = when (languageDirection) {
+            "ENGLISH_TO_FRENCH" -> "en-US"
+            "FRENCH_TO_ENGLISH" -> "fr-FR"
+            else -> "auto"
+        }
+        speechEngine.startListening(speechLang) { speechHeard ->
+            if (speechHeard.isNotBlank()) {
+                handleLiveSpeech(speechHeard)
             }
         }
     }
@@ -241,16 +253,24 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
         speechEngine.stopListening()
     }
 
-    fun handleLiveSpeech(frenchSpeech: String) {
+    fun handleLiveSpeech(spokenText: String) {
         viewModelScope.launch {
             val translation = repository.answerOrTranslate(
-                userInput = frenchSpeech,
+                userInput = spokenText,
                 mode = if (_liveMode.value == "TALK_TUTOR") "TUTOR" else "QUICK",
-                showPhonetics = false
+                showPhonetics = _showPhonetics.value
             )
+            val isInputEnglish = translation.detectedLanguage == "English"
             val newItem = LiveTranscriptItem(
-                french = frenchSpeech,
-                english = translation.englishText.ifEmpty { translation.frenchText }
+                spokenText = spokenText,
+                translatedText = if (isInputEnglish) translation.frenchText else translation.englishText,
+                spokenLang = translation.detectedLanguage,
+                targetLang = translation.targetLanguage,
+                french = translation.frenchText,
+                english = if (isInputEnglish) spokenText else translation.englishText,
+                phonetics = translation.phoneticText,
+                alternatives = translation.alternatives,
+                explanation = translation.explanation
             )
             _liveTranscripts.value = listOf(newItem) + _liveTranscripts.value
         }
@@ -428,7 +448,12 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
         viewModelScope.launch {
             try {
                 repository.extractTextFromImage(bitmap, _selectedChapterId.value, fileName)
-                _uploadStatusMessage.value = "Textbook page added to study sources!"
+                _uploadStatusMessage.value = "Textbook page added! Updating study guide..."
+                val chapter = chapters.value.find { it.id == _selectedChapterId.value }
+                val title = chapter?.title ?: "Chapter Notes"
+                val updatedNote = repository.generateOrUpdateSmartNotes(_selectedChapterId.value, title)
+                _currentStudyNote.value = updatedNote
+                _uploadStatusMessage.value = "Textbook page added & study guide updated!"
             } finally {
                 _isUploading.value = false
             }

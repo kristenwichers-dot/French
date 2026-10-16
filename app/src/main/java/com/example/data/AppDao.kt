@@ -24,6 +24,9 @@ interface AppDao {
     @Query("SELECT * FROM course_documents WHERE chapterId = :chapterId ORDER BY createdAt DESC")
     fun getDocumentsByChapter(chapterId: String): Flow<List<CourseDocumentEntity>>
 
+    @Query("SELECT * FROM course_documents WHERE chapterId = :chapterId ORDER BY createdAt DESC")
+    suspend fun getDocumentsListByChapter(chapterId: String): List<CourseDocumentEntity>
+
     @Query("SELECT * FROM course_documents WHERE title LIKE '%' || :query || '%' OR contentText LIKE '%' || :query || '%'")
     suspend fun searchDocuments(query: String): List<CourseDocumentEntity>
 

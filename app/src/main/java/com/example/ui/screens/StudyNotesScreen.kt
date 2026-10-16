@@ -7,7 +7,9 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -34,12 +36,17 @@ fun StudyNotesScreen(
     val noteLength by viewModel.noteLength.collectAsState()
     val chapters by viewModel.chapters.collectAsState()
     val selectedChapterId by viewModel.selectedChapterId.collectAsState()
+    val allDocuments by viewModel.documents.collectAsState()
+    val classDocuments = remember(allDocuments, selectedChapterId) {
+        allDocuments.filter { it.chapterId == selectedChapterId }
+    }
 
     var explainConceptTitle by remember { mutableStateOf<String?>(null) }
     var explainConceptBody by remember { mutableStateOf<String?>(null) }
     var showPasteToGuideDialog by remember { mutableStateOf(false) }
     var pasteSectionTarget by remember { mutableStateOf("GRAMMAR") }
     var textToPaste by remember { mutableStateOf("") }
+    var previewDoc by remember { mutableStateOf<com.example.data.CourseDocumentEntity?>(null) }
 
     Column(
         modifier = modifier
@@ -202,6 +209,107 @@ fun StudyNotesScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp),
             contentPadding = PaddingValues(bottom = 32.dp)
         ) {
+            // Grounded in My Class Uploads Card
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                    ),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("class_materials_grounding_card")
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    Icons.Default.School,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "GROUNDED IN MY CLASS (${classDocuments.size} SOURCES)",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 0.5.sp
+                                    ),
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            IconButton(
+                                onClick = {
+                                    viewModel.regenerateNotes()
+                                    Toast.makeText(context, "Study guide re-grounded with all class uploads!", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Sync,
+                                    contentDescription = "Sync with class uploads",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (classDocuments.isNotEmpty())
+                                "These notes are actively synthesized from your textbook chapters, lectures, and notes uploaded under 'My Class'."
+                            else
+                                "No materials uploaded for this chapter yet. Upload textbook pages or audio under 'My Class' to auto-generate custom notes.",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        if (classDocuments.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                classDocuments.forEach { doc ->
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.surface,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = doc.title,
+                                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                                                    maxLines = 1
+                                                )
+                                                Text(
+                                                    text = "${doc.sourceTypeName} • ${doc.pageOrTimestamp}",
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                                    color = MaterialTheme.colorScheme.outline
+                                                )
+                                            }
+                                            TextButton(
+                                                onClick = { previewDoc = doc },
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                            ) {
+                                                Text("View", fontSize = 11.sp)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Summary Card depending on length
             item {
                 Card(
@@ -558,6 +666,74 @@ fun StudyNotesScreen(
                         ) {
                             Text("Add to Guide")
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Document Source Preview Modal
+    previewDoc?.let { doc ->
+        Dialog(onDismissRequest = { previewDoc = null }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surface,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(20.dp)
+                        .fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = doc.title,
+                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "${doc.sourceTypeName} • ${doc.pageOrTimestamp}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
+                        IconButton(onClick = { previewDoc = null }) {
+                            Icon(Icons.Default.Close, contentDescription = "Close")
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 300.dp)
+                    ) {
+                        Text(
+                            text = doc.contentText,
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp, lineHeight = 18.sp),
+                            modifier = Modifier
+                                .padding(12.dp)
+                                .verticalScroll(rememberScrollState())
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Button(
+                        onClick = { previewDoc = null },
+                        modifier = Modifier.align(Alignment.End)
+                    ) {
+                        Text("Done")
                     }
                 }
             }
