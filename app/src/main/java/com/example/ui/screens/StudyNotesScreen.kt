@@ -235,12 +235,15 @@ fun StudyNotesScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "GROUNDED IN MY CLASS (${classDocuments.size} SOURCES)",
+                                    text = if (classDocuments.isNotEmpty())
+                                        "GROUNDED IN MY CLASS (${classDocuments.size} SOURCES)"
+                                    else
+                                        "COURSE OVERVIEW (NO CLASS UPLOADS YET)",
                                     style = MaterialTheme.typography.labelMedium.copy(
                                         fontWeight = FontWeight.Bold,
                                         letterSpacing = 0.5.sp
                                     ),
-                                    color = MaterialTheme.colorScheme.primary
+                                    color = if (classDocuments.isNotEmpty()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                                 )
                             }
                             IconButton(

@@ -2,10 +2,12 @@ package com.example.viewmodel
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.FrenchSpeechEngine
 import com.example.data.*
+import com.example.network.GeminiClient
 import com.example.repository.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -30,7 +32,8 @@ data class LiveTranscriptItem(
     val phonetics: String = "",
     val alternatives: List<String> = emptyList(),
     val explanation: String = "",
-    val timestamp: String = "Just now"
+    val timestamp: String = "Just now",
+    val errorMessage: String? = null
 )
 
 data class ChatMessage(
@@ -40,7 +43,8 @@ data class ChatMessage(
     val englishText: String = "",
     val phoneticText: String = "",
     val explanation: String = "",
-    val citation: String = ""
+    val citation: String = "",
+    val errorMessage: String? = null
 )
 
 class FrenchCompanionViewModel(application: Application) : AndroidViewModel(application) {
@@ -97,6 +101,26 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
         _selectedDocument.value = doc
     }
 
+    fun deleteDocument(doc: CourseDocumentEntity) {
+        viewModelScope.launch {
+            repository.deleteCourseDocument(doc)
+            regenerateNotes()
+        }
+    }
+
+    fun updateCourseDocument(updatedDoc: CourseDocumentEntity) {
+        viewModelScope.launch {
+            try {
+                repository.updateCourseDocument(updatedDoc)
+                loadNotesForSelectedChapter()
+                _uploadStatusMessage.value = "Document '${updatedDoc.title}' corrections saved!"
+            } catch (e: Exception) {
+                Log.e("FrenchCompanionViewModel", "Error updating document", e)
+                _uploadErrorMessage.value = "Failed to save corrections: ${e.localizedMessage}"
+            }
+        }
+    }
+
     // Study Notes
     private val _currentStudyNote = MutableStateFlow<StudyNoteEntity?>(null)
     val currentStudyNote: StateFlow<StudyNoteEntity?> = _currentStudyNote.asStateFlow()
@@ -128,8 +152,12 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
             val chapterId = _selectedChapterId.value
             val chapter = chapters.value.find { it.id == chapterId }
             val title = chapter?.title ?: "Chapter Notes"
-            val generated = repository.generateOrUpdateSmartNotes(chapterId, title)
-            _currentStudyNote.value = generated
+            try {
+                val generated = repository.generateOrUpdateSmartNotes(chapterId, title)
+                _currentStudyNote.value = generated
+            } catch (e: Exception) {
+                Log.e("FrenchCompanionViewModel", "Error regenerating notes", e)
+            }
         }
     }
 
@@ -152,6 +180,18 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
 
     private val _translationMode = MutableStateFlow("AUTO") // "AUTO", "QUICK", "TUTOR"
     val translationMode: StateFlow<String> = _translationMode.asStateFlow()
+
+    private val _customApiKey = MutableStateFlow("")
+    val customApiKey: StateFlow<String> = _customApiKey.asStateFlow()
+
+    fun saveCustomApiKey(key: String) {
+        val clean = key.trim()
+        _customApiKey.value = clean
+        GeminiClient.setCustomApiKey(clean)
+        viewModelScope.launch {
+            repository.setSetting("custom_gemini_api_key", clean)
+        }
+    }
 
     fun setSourcePreference(pref: String) {
         _sourcePreference.value = pref
@@ -190,22 +230,32 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
         _isChatLoading.value = true
 
         viewModelScope.launch {
-            val result = repository.answerOrTranslate(
-                userInput = text,
-                mode = _translationMode.value,
-                sourcePreference = _sourcePreference.value,
-                showPhonetics = _showPhonetics.value
-            )
-            val tutorMsg = ChatMessage(
-                sender = "TUTOR",
-                frenchText = result.frenchText,
-                englishText = result.englishText,
-                phoneticText = result.phoneticText,
-                explanation = result.explanation,
-                citation = result.citation
-            )
-            _chatMessages.value = _chatMessages.value + tutorMsg
-            _isChatLoading.value = false
+            try {
+                val result = repository.answerOrTranslate(
+                    userInput = text,
+                    mode = _translationMode.value,
+                    sourcePreference = _sourcePreference.value,
+                    showPhonetics = _showPhonetics.value
+                )
+                val tutorMsg = ChatMessage(
+                    sender = "TUTOR",
+                    frenchText = result.frenchText,
+                    englishText = result.englishText,
+                    phoneticText = result.phoneticText,
+                    explanation = result.explanation,
+                    citation = result.citation,
+                    errorMessage = result.errorMessage
+                )
+                _chatMessages.value = _chatMessages.value + tutorMsg
+            } catch (e: Exception) {
+                _chatMessages.value = _chatMessages.value + ChatMessage(
+                    sender = "TUTOR",
+                    englishText = "Error: ${e.localizedMessage ?: "Failed to reach French tutor"}",
+                    errorMessage = e.localizedMessage
+                )
+            } finally {
+                _isChatLoading.value = false
+            }
         }
     }
 
@@ -215,13 +265,23 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
         onResult: (TranslationResult) -> Unit
     ) {
         viewModelScope.launch {
-            val result = repository.answerOrTranslate(
-                userInput = text,
-                mode = if (addExplanation) "TUTOR" else "QUICK",
-                sourcePreference = _sourcePreference.value,
-                showPhonetics = _showPhonetics.value
-            )
-            onResult(result)
+            try {
+                val result = repository.answerOrTranslate(
+                    userInput = text,
+                    mode = if (addExplanation) "TUTOR" else "QUICK",
+                    sourcePreference = _sourcePreference.value,
+                    showPhonetics = _showPhonetics.value
+                )
+                onResult(result)
+            } catch (e: Exception) {
+                onResult(
+                    TranslationResult(
+                        frenchText = "",
+                        englishText = "",
+                        errorMessage = e.localizedMessage ?: "Translation failed"
+                    )
+                )
+            }
         }
     }
 
@@ -242,11 +302,19 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
             "FRENCH_TO_ENGLISH" -> "fr-FR"
             else -> "auto"
         }
-        speechEngine.startListening(speechLang) { speechHeard ->
+        speechEngine.startListening(language = speechLang, continuous = true) { speechHeard ->
             if (speechHeard.isNotBlank()) {
                 handleLiveSpeech(speechHeard)
             }
         }
+    }
+
+    fun pauseLiveListening() {
+        speechEngine.pauseListening()
+    }
+
+    fun resumeLiveListening() {
+        speechEngine.resumeListening()
     }
 
     fun stopLiveListening() {
@@ -255,24 +323,34 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
 
     fun handleLiveSpeech(spokenText: String) {
         viewModelScope.launch {
-            val translation = repository.answerOrTranslate(
-                userInput = spokenText,
-                mode = if (_liveMode.value == "TALK_TUTOR") "TUTOR" else "QUICK",
-                showPhonetics = _showPhonetics.value
-            )
-            val isInputEnglish = translation.detectedLanguage == "English"
-            val newItem = LiveTranscriptItem(
-                spokenText = spokenText,
-                translatedText = if (isInputEnglish) translation.frenchText else translation.englishText,
-                spokenLang = translation.detectedLanguage,
-                targetLang = translation.targetLanguage,
-                french = translation.frenchText,
-                english = if (isInputEnglish) spokenText else translation.englishText,
-                phonetics = translation.phoneticText,
-                alternatives = translation.alternatives,
-                explanation = translation.explanation
-            )
-            _liveTranscripts.value = listOf(newItem) + _liveTranscripts.value
+            try {
+                val translation = repository.answerOrTranslate(
+                    userInput = spokenText,
+                    mode = if (_liveMode.value == "TALK_TUTOR") "TUTOR" else "QUICK",
+                    showPhonetics = _showPhonetics.value
+                )
+                val isInputEnglish = translation.detectedLanguage == "English"
+                val newItem = LiveTranscriptItem(
+                    spokenText = spokenText,
+                    translatedText = if (isInputEnglish) translation.frenchText else translation.englishText,
+                    spokenLang = translation.detectedLanguage,
+                    targetLang = translation.targetLanguage,
+                    french = translation.frenchText,
+                    english = if (isInputEnglish) spokenText else translation.englishText,
+                    phonetics = translation.phoneticText,
+                    alternatives = translation.alternatives,
+                    explanation = translation.explanation,
+                    errorMessage = translation.errorMessage
+                )
+                _liveTranscripts.value = listOf(newItem) + _liveTranscripts.value
+            } catch (e: Exception) {
+                val errorItem = LiveTranscriptItem(
+                    spokenText = spokenText,
+                    translatedText = "Translation error",
+                    errorMessage = e.localizedMessage
+                )
+                _liveTranscripts.value = listOf(errorItem) + _liveTranscripts.value
+            }
         }
     }
 
@@ -284,7 +362,7 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
         viewModelScope.launch {
             if (_liveTranscripts.value.isEmpty()) return@launch
             val content = _liveTranscripts.value.joinToString("\n\n") {
-                "French: ${it.french}\nEnglish: ${it.english}"
+                "Spoken (${it.spokenLang}): ${it.spokenText}\nTranslated (${it.targetLang}): ${it.translatedText}"
             }
             val doc = CourseDocumentEntity(
                 chapterId = _selectedChapterId.value,
@@ -296,6 +374,7 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
                 isProfessorEmphasis = false
             )
             database.appDao().insertDocument(doc)
+            regenerateNotes()
         }
     }
 
@@ -361,7 +440,6 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
             _isAnswerSubmitted.value = false
         } else {
             _isQuizCompleted.value = true
-            // Record quiz result
             viewModelScope.launch {
                 repository.recordQuizResults(
                     chapterId = _selectedChapterId.value,
@@ -439,56 +517,166 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
     private val _isUploading = MutableStateFlow(false)
     val isUploading: StateFlow<Boolean> = _isUploading.asStateFlow()
 
-    private val _uploadStatusMessage = MutableStateFlow<String?>("Uploading & indexing course materials...")
+    private val _uploadStatusMessage = MutableStateFlow<String?>(null)
     val uploadStatusMessage: StateFlow<String?> = _uploadStatusMessage.asStateFlow()
 
-    fun uploadTextbookImage(bitmap: Bitmap, fileName: String) {
+    private val _uploadErrorMessage = MutableStateFlow<String?>(null)
+    val uploadErrorMessage: StateFlow<String?> = _uploadErrorMessage.asStateFlow()
+
+    fun clearUploadStatus() {
+        _uploadErrorMessage.value = null
+        _uploadStatusMessage.value = null
+    }
+
+    fun uploadTextbookImage(
+        bitmap: Bitmap,
+        fileName: String,
+        targetChapterId: String = _selectedChapterId.value,
+        onSuccess: (() -> Unit)? = null
+    ) {
         _isUploading.value = true
+        _uploadErrorMessage.value = null
         _uploadStatusMessage.value = "Extracting French text with Gemini & preserving accents..."
+
         viewModelScope.launch {
             try {
-                repository.extractTextFromImage(bitmap, _selectedChapterId.value, fileName)
-                _uploadStatusMessage.value = "Textbook page added! Updating study guide..."
-                val chapter = chapters.value.find { it.id == _selectedChapterId.value }
+                val doc = repository.extractTextFromImage(bitmap, targetChapterId, fileName)
+                _uploadStatusMessage.value = "Textbook page saved! Updating study guide..."
+                val chapter = chapters.value.find { it.id == targetChapterId }
                 val title = chapter?.title ?: "Chapter Notes"
-                val updatedNote = repository.generateOrUpdateSmartNotes(_selectedChapterId.value, title)
-                _currentStudyNote.value = updatedNote
-                _uploadStatusMessage.value = "Textbook page added & study guide updated!"
+                val updatedNote = repository.generateOrUpdateSmartNotes(targetChapterId, title)
+                if (targetChapterId == _selectedChapterId.value) {
+                    _currentStudyNote.value = updatedNote
+                }
+                _uploadStatusMessage.value = "Successfully extracted '${doc.title}' into course library!"
+                onSuccess?.invoke()
+            } catch (e: Exception) {
+                Log.e("FrenchCompanionViewModel", "Textbook upload failed", e)
+                _uploadErrorMessage.value = e.localizedMessage ?: "Failed to extract text from textbook image. Please verify your Gemini API key or connection."
+                _uploadStatusMessage.value = null
             } finally {
                 _isUploading.value = false
+                try {
+                    if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+                } catch (ignored: Exception) {}
             }
         }
     }
 
-    fun uploadAndTranscribeAudio(audioBytes: ByteArray, mimeType: String, fileName: String) {
+    fun uploadMultipleTextbookImages(
+        items: List<Pair<Bitmap, String>>,
+        targetChapterId: String = _selectedChapterId.value,
+        onSuccess: (() -> Unit)? = null
+    ) {
+        if (items.isEmpty()) return
         _isUploading.value = true
+        _uploadErrorMessage.value = null
+
+        viewModelScope.launch {
+            var successCount = 0
+            var errorCount = 0
+            var lastError: String? = null
+
+            for ((index, item) in items.withIndex()) {
+                val (bitmap, fileName) = item
+                _uploadStatusMessage.value = "Processing page ${index + 1} of ${items.size}: $fileName..."
+                try {
+                    repository.extractTextFromImage(bitmap, targetChapterId, fileName)
+                    successCount++
+                } catch (e: Exception) {
+                    Log.e("FrenchCompanionViewModel", "Failed page $fileName", e)
+                    errorCount++
+                    lastError = e.localizedMessage
+                } finally {
+                    try {
+                        if (!bitmap.isRecycled) {
+                            bitmap.recycle()
+                        }
+                    } catch (ignored: Exception) {}
+                }
+            }
+
+            if (successCount > 0) {
+                _uploadStatusMessage.value = "Updating study guide with $successCount pages..."
+                val chapter = chapters.value.find { it.id == targetChapterId }
+                val title = chapter?.title ?: "Chapter Notes"
+                try {
+                    val updatedNote = repository.generateOrUpdateSmartNotes(targetChapterId, title)
+                    if (targetChapterId == _selectedChapterId.value) {
+                        _currentStudyNote.value = updatedNote
+                    }
+                } catch (e: Exception) {
+                    Log.e("FrenchCompanionViewModel", "Failed updating smart notes", e)
+                }
+                _uploadStatusMessage.value = "Successfully processed and saved $successCount page(s) to course library!"
+                onSuccess?.invoke()
+            }
+
+            if (errorCount > 0) {
+                _uploadErrorMessage.value = "Failed to process $errorCount page(s): ${lastError ?: "Gemini extraction error"}"
+            }
+
+            _isUploading.value = false
+        }
+    }
+
+    fun uploadAndTranscribeAudio(
+        audioBytes: ByteArray,
+        mimeType: String,
+        fileName: String,
+        targetChapterId: String = _selectedChapterId.value,
+        onSuccess: (() -> Unit)? = null
+    ) {
+        _isUploading.value = true
+        _uploadErrorMessage.value = null
         _uploadStatusMessage.value = "Transcribing $fileName with Gemini & extracting exam warnings..."
+
         viewModelScope.launch {
             try {
-                repository.transcribeAudioFile(audioBytes, mimeType, _selectedChapterId.value, fileName)
-                _uploadStatusMessage.value = "Updating study guide with lecture notes..."
-                val chapter = chapters.value.find { it.id == _selectedChapterId.value }
+                val doc = repository.transcribeAudioFile(audioBytes, mimeType, targetChapterId, fileName)
+                _uploadStatusMessage.value = "Transcript saved! Updating study guide..."
+                val chapter = chapters.value.find { it.id == targetChapterId }
                 val title = chapter?.title ?: "Chapter Notes"
-                val updatedNote = repository.generateOrUpdateSmartNotes(_selectedChapterId.value, title)
-                _currentStudyNote.value = updatedNote
-                _uploadStatusMessage.value = "Lecture added to study sources & study guide updated!"
+                val updatedNote = repository.generateOrUpdateSmartNotes(targetChapterId, title)
+                if (targetChapterId == _selectedChapterId.value) {
+                    _currentStudyNote.value = updatedNote
+                }
+                _uploadStatusMessage.value = "Successfully transcribed and saved lecture to course library!"
+                onSuccess?.invoke()
+            } catch (e: Exception) {
+                Log.e("FrenchCompanionViewModel", "Audio upload failed", e)
+                _uploadErrorMessage.value = e.localizedMessage ?: "Failed to transcribe audio file. Ensure the file is valid and under 20MB."
+                _uploadStatusMessage.value = null
             } finally {
                 _isUploading.value = false
             }
         }
     }
 
-    fun savePastedCourseNotes(title: String, content: String) {
+    fun savePastedCourseNotes(
+        title: String,
+        content: String,
+        targetChapterId: String = _selectedChapterId.value
+    ) {
         _isUploading.value = true
+        _uploadErrorMessage.value = null
         _uploadStatusMessage.value = "Indexing pasted text into study sources..."
+
         viewModelScope.launch {
             try {
-                repository.savePastedCourseNotes(_selectedChapterId.value, title, content)
-                val chapter = chapters.value.find { it.id == _selectedChapterId.value }
+                repository.savePastedCourseNotes(targetChapterId, title, content)
+                val chapter = chapters.value.find { it.id == targetChapterId }
                 val noteTitle = chapter?.title ?: "Chapter Notes"
-                val updatedNote = repository.generateOrUpdateSmartNotes(_selectedChapterId.value, noteTitle)
-                _currentStudyNote.value = updatedNote
+                val updatedNote = repository.generateOrUpdateSmartNotes(targetChapterId, noteTitle)
+                if (targetChapterId == _selectedChapterId.value) {
+                    _currentStudyNote.value = updatedNote
+                }
                 _uploadStatusMessage.value = "Notes indexed into study guide!"
+            } catch (e: Exception) {
+                Log.e("FrenchCompanionViewModel", "Error saving pasted notes", e)
+                _uploadErrorMessage.value = e.localizedMessage ?: "Error indexing pasted notes"
             } finally {
                 _isUploading.value = false
             }
@@ -497,6 +685,8 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
 
     fun uploadLectureTranscript(notes: String, fileName: String) {
         _isUploading.value = true
+        _uploadErrorMessage.value = null
+
         viewModelScope.launch {
             try {
                 repository.analyzeLectureNotes(_selectedChapterId.value, notes, fileName)
@@ -504,6 +694,10 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
                 val title = chapter?.title ?: "Chapter Notes"
                 val updatedNote = repository.generateOrUpdateSmartNotes(_selectedChapterId.value, title)
                 _currentStudyNote.value = updatedNote
+                _uploadStatusMessage.value = "Lecture transcript analyzed & saved!"
+            } catch (e: Exception) {
+                Log.e("FrenchCompanionViewModel", "Error analyzing lecture notes", e)
+                _uploadErrorMessage.value = e.localizedMessage ?: "Error analyzing lecture transcript"
             } finally {
                 _isUploading.value = false
             }
@@ -545,9 +739,14 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
     fun solveHomework(question: String, style: String) {
         _isSolvingHomework.value = true
         viewModelScope.launch {
-            val ans = repository.solveHomework(question, style)
-            _homeworkAnswer.value = ans
-            _isSolvingHomework.value = false
+            try {
+                val ans = repository.solveHomework(question, style)
+                _homeworkAnswer.value = ans
+            } catch (e: Exception) {
+                _homeworkAnswer.value = "Error: ${e.localizedMessage ?: "Failed to get homework help"}"
+            } finally {
+                _isSolvingHomework.value = false
+            }
         }
     }
 
@@ -572,12 +771,23 @@ class FrenchCompanionViewModel(application: Application) : AndroidViewModel(appl
 
     // Audio Playback
     fun speakFrench(text: String, speed: Float? = null) {
-        speechEngine.speak(text, speed)
+        speechEngine.speak(text, speed, locale = java.util.Locale.FRENCH)
+    }
+
+    fun speakEnglish(text: String, speed: Float? = null) {
+        speechEngine.speak(text, speed, locale = java.util.Locale.US)
     }
 
     init {
-        // Initial notes load
-        loadNotesForSelectedChapter()
+        // Load custom Gemini API key from database setting if saved
+        viewModelScope.launch {
+            val savedKey = repository.getSetting("custom_gemini_api_key")
+            if (!savedKey.isNullOrBlank()) {
+                _customApiKey.value = savedKey
+                GeminiClient.setCustomApiKey(savedKey)
+            }
+            loadNotesForSelectedChapter()
+        }
     }
 
     override fun onCleared() {

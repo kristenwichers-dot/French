@@ -331,6 +331,15 @@ fun ChatBubble(
                         }
                     }
 
+                    if (message.errorMessage != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "⚠️ ${message.errorMessage}",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+
                     if (message.citation.isNotBlank()) {
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(

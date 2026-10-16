@@ -33,8 +33,14 @@ interface AppDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertDocument(document: CourseDocumentEntity): Long
 
+    @Update
+    suspend fun updateDocument(document: CourseDocumentEntity)
+
     @Delete
     suspend fun deleteDocument(document: CourseDocumentEntity)
+
+    @Query("SELECT * FROM course_documents WHERE chapterId = :chapterId AND originalFileName = :fileName LIMIT 1")
+    suspend fun findDocumentByChapterAndFileName(chapterId: String, fileName: String): CourseDocumentEntity?
 
     // Study Notes
     @Query("SELECT * FROM study_notes WHERE chapterId = :chapterId LIMIT 1")

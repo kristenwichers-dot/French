@@ -3,6 +3,8 @@ package com.example.audio
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -20,17 +22,23 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
     private var isTtsReady = false
 
     private var speechRecognizer: SpeechRecognizer? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val _isListening = MutableStateFlow(false)
     val isListening: StateFlow<Boolean> = _isListening.asStateFlow()
 
+    private val _isContinuousMode = MutableStateFlow(false)
+    val isContinuousMode: StateFlow<Boolean> = _isContinuousMode.asStateFlow()
+
     private val _liveTranscript = MutableStateFlow("")
     val liveTranscript: StateFlow<String> = _liveTranscript.asStateFlow()
 
-    private val _speechRate = MutableStateFlow(0.85f) // Slightly slower for beginning learners
+    private val _speechRate = MutableStateFlow(0.85f)
     val speechRate: StateFlow<Float> = _speechRate.asStateFlow()
 
+    private var currentLanguage = "auto"
     private var onSpeechResultListener: ((String) -> Unit)? = null
+    private var isPaused = false
 
     init {
         initTts()
@@ -42,7 +50,6 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
                 val result = tts?.setLanguage(Locale.FRENCH)
                 isTtsReady = result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED
                 if (!isTtsReady) {
-                    // Fallback to France
                     tts?.setLanguage(Locale.FRANCE)
                     isTtsReady = true
                 }
@@ -82,35 +89,53 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
         tts?.stop()
     }
 
-    fun startListening(language: String = "auto", onResult: ((String) -> Unit)? = null) {
+    fun startListening(
+        language: String = "auto",
+        continuous: Boolean = false,
+        onResult: ((String) -> Unit)? = null
+    ) {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             Log.w("FrenchSpeechEngine", "Speech recognition not available on this device")
             return
         }
 
-        stopListening()
+        currentLanguage = language
+        _isContinuousMode.value = continuous
+        isPaused = false
         onSpeechResultListener = onResult
 
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-            setRecognitionListener(this@FrenchSpeechEngine)
-        }
+        startRecognitionInternal()
+    }
 
-        val resolvedLang = when {
-            language.equals("auto", ignoreCase = true) -> Locale.getDefault().toLanguageTag()
-            language.startsWith("en", ignoreCase = true) -> "en-US"
-            language.startsWith("fr", ignoreCase = true) -> "fr-FR"
-            else -> language
-        }
-
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, resolvedLang)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, resolvedLang)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-        }
-
+    private fun startRecognitionInternal() {
         try {
+            speechRecognizer?.destroy()
+            speechRecognizer = null
+
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
+                setRecognitionListener(this@FrenchSpeechEngine)
+            }
+
+            val resolvedPrimary = when {
+                currentLanguage.startsWith("en", ignoreCase = true) -> "en-US"
+                currentLanguage.startsWith("fr", ignoreCase = true) -> "fr-FR"
+                else -> {
+                    // For auto, prefer French if device is set to fr, or en-US with fr support
+                    if (Locale.getDefault().language == "fr") "fr-FR" else "en-US"
+                }
+            }
+
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, resolvedPrimary)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, resolvedPrimary)
+                putExtra("android.speech.extra.ADDITIONAL_LANGUAGES", arrayOf("fr-FR", "en-US"))
+                putExtra("android.speech.extra.LANGUAGE_DETECTION_ALLOWED_LANGUAGES", arrayOf("fr-FR", "en-US"))
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+            }
+
             speechRecognizer?.startListening(intent)
             _isListening.value = true
         } catch (e: Exception) {
@@ -119,7 +144,23 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
         }
     }
 
+    fun pauseListening() {
+        isPaused = true
+        _isListening.value = false
+        speechRecognizer?.stopListening()
+    }
+
+    fun resumeListening() {
+        if (isPaused) {
+            isPaused = false
+            startRecognitionInternal()
+        }
+    }
+
     fun stopListening() {
+        _isContinuousMode.value = false
+        isPaused = false
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             speechRecognizer?.stopListening()
             speechRecognizer?.destroy()
@@ -132,33 +173,57 @@ class FrenchSpeechEngine(private val context: Context) : RecognitionListener {
     }
 
     // Speech recognition callbacks
-    override fun onReadyForSpeech(params: Bundle?) {}
+    override fun onReadyForSpeech(params: Bundle?) {
+        _isListening.value = true
+    }
+
     override fun onBeginningOfSpeech() {}
     override fun onRmsChanged(rmsdB: Float) {}
     override fun onBufferReceived(buffer: ByteArray?) {}
+
     override fun onEndOfSpeech() {
         _isListening.value = false
     }
 
     override fun onError(error: Int) {
         _isListening.value = false
-        Log.w("FrenchSpeechEngine", "SpeechRecognizer error code: $error")
+        Log.d("FrenchSpeechEngine", "SpeechRecognizer error code: $error")
+
+        // If continuous mode is active and not manually stopped/paused, auto-recover
+        if (_isContinuousMode.value && !isPaused) {
+            mainHandler.postDelayed({
+                if (_isContinuousMode.value && !isPaused) {
+                    startRecognitionInternal()
+                }
+            }, 400)
+        }
     }
 
     override fun onResults(results: Bundle?) {
         _isListening.value = false
         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
         val bestResult = matches?.firstOrNull() ?: ""
-        if (bestResult.isNotEmpty()) {
+        if (bestResult.isNotBlank()) {
             _liveTranscript.value = bestResult
             onSpeechResultListener?.invoke(bestResult)
+        }
+
+        // In continuous mode, continue listening for the next phrase
+        if (_isContinuousMode.value && !isPaused) {
+            mainHandler.postDelayed({
+                if (_isContinuousMode.value && !isPaused) {
+                    startRecognitionInternal()
+                }
+            }, 300)
         }
     }
 
     override fun onPartialResults(partialResults: Bundle?) {
         val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
         matches?.firstOrNull()?.let {
-            _liveTranscript.value = it
+            if (it.isNotBlank()) {
+                _liveTranscript.value = it
+            }
         }
     }
 

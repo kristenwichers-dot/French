@@ -4,8 +4,10 @@ import android.widget.Toast
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -13,9 +15,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.network.GeminiClient
 import com.example.viewmodel.FrenchCompanionViewModel
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
@@ -23,9 +30,24 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val sourcePreference by viewModel.sourcePreference.collectAsState()
     val showPhonetics by viewModel.showPhonetics.collectAsState()
     val speechRate by viewModel.speechEngine.speechRate.collectAsState()
+    val customApiKey by viewModel.customApiKey.collectAsState()
+
+    var keyInputText by remember { mutableStateOf("") }
+    var isKeyVisible by remember { mutableStateOf(false) }
+    var testResultStatus by remember { mutableStateOf<String?>(null) }
+    var isTestingConnection by remember { mutableStateOf(false) }
+
+    LaunchedEffect(customApiKey) {
+        if (customApiKey.isNotBlank()) {
+            keyInputText = customApiKey
+        }
+    }
+
+    val isKeyConfigured = GeminiClient.isKeyConfigured()
 
     LazyColumn(
         modifier = modifier
@@ -44,6 +66,161 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+
+        // Gemini AI Configuration Card
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("gemini_config_card")
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "GEMINI AI CONFIGURATION",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 1.sp),
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (isKeyConfigured) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (isKeyConfigured) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                    contentDescription = null,
+                                    tint = if (isKeyConfigured) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (isKeyConfigured) "Configured & Active" else "API Key Missing",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = if (isKeyConfigured) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Gemini Model: ${GeminiClient.DEFAULT_MODEL}. Used for instant multimodal translation, OCR textbook extraction, and source-grounded notes.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    OutlinedTextField(
+                        value = keyInputText,
+                        onValueChange = { keyInputText = it },
+                        label = { Text("Gemini API Key") },
+                        placeholder = { Text("Paste your AI Studio API key here...") },
+                        singleLine = true,
+                        visualTransformation = if (isKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(onClick = { isKeyVisible = !isKeyVisible }) {
+                                Icon(
+                                    imageVector = if (isKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (isKeyVisible) "Hide key" else "Show key"
+                                )
+                            }
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("gemini_key_input")
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                viewModel.saveCustomApiKey(keyInputText)
+                                Toast.makeText(context, "API Key saved securely!", Toast.LENGTH_SHORT).show()
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("save_api_key_btn")
+                        ) {
+                            Text("Save Key")
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                isTestingConnection = true
+                                testResultStatus = null
+                                coroutineScope.launch {
+                                    try {
+                                        val testKey = keyInputText.ifBlank { GeminiClient.getApiKey() }
+                                        if (testKey.isBlank() || testKey == "MY_GEMINI_API_KEY") {
+                                            testResultStatus = "Please enter an API key to test."
+                                        } else {
+                                            GeminiClient.setCustomApiKey(testKey)
+                                            val response = GeminiClient.service.generateContent(
+                                                apiKey = testKey,
+                                                model = GeminiClient.DEFAULT_MODEL,
+                                                request = com.example.network.GenerateContentRequest(
+                                                    contents = listOf(
+                                                        com.example.network.Content(
+                                                            parts = listOf(com.example.network.Part(text = "Respond with 'OK'"))
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                            val text = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                                            testResultStatus = if (!text.isNullOrBlank()) "Connection successful to Gemini 3.5 Flash!" else "Connection received empty response"
+                                        }
+                                    } catch (e: Exception) {
+                                        testResultStatus = "Connection error: ${e.localizedMessage ?: e.message}"
+                                    } finally {
+                                        isTestingConnection = false
+                                    }
+                                }
+                            },
+                            enabled = !isTestingConnection,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1.2f)
+                                .testTag("test_gemini_connection_btn")
+                        ) {
+                            if (isTestingConnection) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(6.dp))
+                            }
+                            Text("Test Connection")
+                        }
+                    }
+
+                    if (testResultStatus != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = testResultStatus ?: "",
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = if (testResultStatus?.contains("successful", ignoreCase = true) == true)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            }
         }
 
         // Source Grounding Preference
@@ -178,22 +355,10 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "All uploaded textbook excerpts, quiz histories, and voice recordings remain private on your device. Live microphone listening only activates on explicit user tap.",
+                        text = "All uploaded textbook excerpts, quiz histories, and voice recordings remain private on your device in local Room database. No complete requests, audio recordings, or textbook photos are logged in production.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Spacer(modifier = Modifier.height(14.dp))
-                    OutlinedButton(
-                        onClick = {
-                            Toast.makeText(context, "Course data reset to Beginning French I defaults", Toast.LENGTH_SHORT).show()
-                        },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                        modifier = Modifier.testTag("reset_data_btn")
-                    ) {
-                        Icon(Icons.Default.DeleteOutline, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Reset & Reseed Course Data")
-                    }
                 }
             }
         }

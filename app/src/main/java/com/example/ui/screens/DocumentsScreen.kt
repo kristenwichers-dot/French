@@ -4,33 +4,39 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.database.Cursor
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.core.content.FileProvider
+import com.example.data.ChapterEntity
 import com.example.data.CourseDocumentEntity
 import com.example.viewmodel.FrenchCompanionViewModel
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -43,59 +49,152 @@ fun DocumentsScreen(
     val selectedChapterId by viewModel.selectedChapterId.collectAsState()
     val isUploading by viewModel.isUploading.collectAsState()
     val uploadStatusMessage by viewModel.uploadStatusMessage.collectAsState()
+    val uploadErrorMessage by viewModel.uploadErrorMessage.collectAsState()
 
     val context = LocalContext.current
     var searchQuery by remember { mutableStateOf("") }
-    var selectedFilterChapter by remember { mutableStateOf(selectedChapterId) }
+    var selectedChapterFilter by remember { mutableStateOf("ALL") }
+    var selectedSourceFilter by remember { mutableStateOf("ALL") }
+    var targetUploadChapterId by remember(selectedChapterId) { mutableStateOf(selectedChapterId) }
     var viewingDoc by remember { mutableStateOf<CourseDocumentEntity?>(null) }
+    var editingDoc by remember { mutableStateOf<CourseDocumentEntity?>(null) }
+    var showTargetChapterPicker by remember { mutableStateOf(false) }
     var showLectureUploadDialog by remember { mutableStateOf(false) }
     var showPasteNotesDialog by remember { mutableStateOf(false) }
+    var showDeleteConfirmDialog by remember { mutableStateOf<CourseDocumentEntity?>(null) }
 
-    // Camera launcher to photograph textbook pages
+    // Camera capture state and launcher (Full high-resolution via FileProvider)
+    var cameraTempUri by remember { mutableStateOf<Uri?>(null) }
+    var cameraTempFile by remember { mutableStateOf<File?>(null) }
     val cameraLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.TakePicturePreview()
-    ) { bitmap: Bitmap? ->
-        if (bitmap != null) {
-            viewModel.uploadTextbookImage(bitmap, "textbook_camera_${System.currentTimeMillis()}.jpg")
+        contract = ActivityResultContracts.TakePicture()
+    ) { success: Boolean ->
+        val uri = cameraTempUri
+        val tempFile = cameraTempFile
+        if (success && uri != null) {
+            val bitmap = decodeBitmapFromUri(context, uri)
+            if (bitmap != null) {
+                viewModel.uploadTextbookImage(
+                    bitmap = bitmap,
+                    fileName = "camera_page_${System.currentTimeMillis()}.jpg",
+                    targetChapterId = targetUploadChapterId,
+                    onSuccess = {
+                        // Discard the original temporary camera file only after extraction & save succeed!
+                        try {
+                            if (tempFile != null && tempFile.exists()) {
+                                tempFile.delete()
+                            }
+                            context.contentResolver.delete(uri, null, null)
+                        } catch (e: Exception) {
+                            Log.w("DocumentsScreen", "Could not delete temp camera file", e)
+                        }
+                    }
+                )
+            } else {
+                Toast.makeText(context, "Could not decode camera photo", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
-    // Photo picker launcher
-    val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri ->
-        if (uri != null) {
-            val sampleBitmap = Bitmap.createBitmap(400, 400, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(sampleBitmap)
-            val paint = Paint().apply { color = android.graphics.Color.WHITE }
-            canvas.drawRect(0f, 0f, 400f, 400f, paint)
-            viewModel.uploadTextbookImage(sampleBitmap, "textbook_scan_${System.currentTimeMillis()}.jpg")
+    // Photo picker launcher (Supports MULTIPLE textbook photos from gallery)
+    val multiPhotoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 10)
+    ) { uris: List<Uri> ->
+        if (uris.isNotEmpty()) {
+            val itemsToUpload = mutableListOf<Pair<Bitmap, String>>()
+            for (uri in uris) {
+                val bmp = decodeBitmapFromUri(context, uri)
+                if (bmp != null) {
+                    val name = getFileNameFromUri(context, uri, "textbook_page_")
+                    itemsToUpload.add(Pair(bmp, name))
+                }
+            }
+            if (itemsToUpload.isNotEmpty()) {
+                viewModel.uploadMultipleTextbookImages(
+                    items = itemsToUpload,
+                    targetChapterId = targetUploadChapterId
+                )
+            } else {
+                Toast.makeText(context, "Could not read selected images", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
-    // Audio / MP3 file launcher to upload and transcribe lectures
+    // Audio file picker launcher (MP3, M4A, WAV, AAC)
     val audioPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
-    ) { uri ->
+    ) { uri: Uri? ->
         if (uri != null) {
             try {
                 var fileName = "lecture_recording_${System.currentTimeMillis()}.mp3"
+                var fileSize = 0L
                 context.contentResolver.query(uri, null, null, null, null)?.use { cursor: Cursor ->
                     val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex != -1 && cursor.moveToFirst()) {
-                        fileName = cursor.getString(nameIndex) ?: fileName
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (cursor.moveToFirst()) {
+                        if (nameIndex != -1) {
+                            val found = cursor.getString(nameIndex)
+                            if (!found.isNullOrBlank()) fileName = found
+                        }
+                        if (sizeIndex != -1) {
+                            fileSize = cursor.getLong(sizeIndex)
+                        }
                     }
                 }
+
+                val sizeMb = fileSize / (1024.0 * 1024.0)
+                if (sizeMb > 20.0) {
+                    Toast.makeText(
+                        context,
+                        "Audio file is %.1f MB. The maximum inline limit is 20 MB. Please select a shorter lecture clip.".format(sizeMb),
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@rememberLauncherForActivityResult
+                }
+
                 val inputStream = context.contentResolver.openInputStream(uri)
-                val bytes = inputStream?.readBytes() ?: ByteArray(0)
-                val mimeType = context.contentResolver.getType(uri) ?: "audio/mp3"
+                val bytes = inputStream?.use { it.readBytes() } ?: ByteArray(0)
+                val mimeType = context.contentResolver.getType(uri) ?: when {
+                    fileName.endsWith(".m4a", ignoreCase = true) -> "audio/mp4"
+                    fileName.endsWith(".wav", ignoreCase = true) -> "audio/wav"
+                    fileName.endsWith(".aac", ignoreCase = true) -> "audio/aac"
+                    else -> "audio/mp3"
+                }
+
                 if (bytes.isNotEmpty()) {
                     Toast.makeText(context, "Uploading & transcribing $fileName...", Toast.LENGTH_SHORT).show()
-                    viewModel.uploadAndTranscribeAudio(bytes, mimeType, fileName)
+                    viewModel.uploadAndTranscribeAudio(
+                        audioBytes = bytes,
+                        mimeType = mimeType,
+                        fileName = fileName,
+                        targetChapterId = targetUploadChapterId
+                    )
+                } else {
+                    Toast.makeText(context, "Audio file was empty", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
-                android.util.Log.e("DocumentsScreen", "Error reading audio file", e)
+                Log.e("DocumentsScreen", "Error reading audio file", e)
+                Toast.makeText(context, "Error reading audio: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+
+    fun launchCamera() {
+        try {
+            val imagesDir = File(context.cacheDir, "images")
+            if (!imagesDir.exists()) imagesDir.mkdirs()
+            val tempFile = File(imagesDir, "camera_photo_${System.currentTimeMillis()}.jpg")
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                tempFile
+            )
+            cameraTempUri = uri
+            cameraTempFile = tempFile
+            cameraLauncher.launch(uri)
+        } catch (e: Exception) {
+            Log.e("DocumentsScreen", "Error launching camera with FileProvider", e)
+            Toast.makeText(context, "Failed to start camera: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -128,13 +227,52 @@ fun DocumentsScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Action Rows: 2 rows of clean study ingestion buttons
+        // Target Upload Chapter Bar
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Folder,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    val curCh = chapters.find { it.id == targetUploadChapterId }
+                    Text(
+                        text = "Upload to: ${curCh?.let { "Ch. ${it.number} (${it.title.take(18)}...)" } ?: "Select Chapter"}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+                TextButton(
+                    onClick = { showTargetChapterPicker = true },
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text("Change", fontSize = 11.sp)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Action Rows: Clean study ingestion buttons
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Button(
-                onClick = { cameraLauncher.launch(null) },
+                onClick = { launchCamera() },
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .weight(1f)
@@ -146,16 +284,20 @@ fun DocumentsScreen(
             }
 
             Button(
-                onClick = { audioPickerLauncher.launch("audio/*") },
+                onClick = {
+                    multiPhotoPickerLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                },
                 shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                 modifier = Modifier
                     .weight(1.2f)
-                    .testTag("upload_mp3_btn")
+                    .testTag("upload_photos_btn")
             ) {
-                Icon(Icons.Default.Audiotrack, contentDescription = null, modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Upload MP3", fontSize = 13.sp)
+                Text("Upload Photos", fontSize = 13.sp)
             }
         }
 
@@ -165,6 +307,19 @@ fun DocumentsScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            Button(
+                onClick = { audioPickerLauncher.launch("audio/*") },
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("upload_mp3_btn")
+            ) {
+                Icon(Icons.Default.Audiotrack, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Upload Audio/MP3", fontSize = 12.sp)
+            }
+
             OutlinedButton(
                 onClick = { showPasteNotesDialog = true },
                 shape = RoundedCornerShape(12.dp),
@@ -176,33 +331,100 @@ fun DocumentsScreen(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Paste Text/Notes", fontSize = 12.sp)
             }
+        }
 
-            OutlinedButton(
-                onClick = { showLectureUploadDialog = true },
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("add_transcript_btn")
+        // Upload in-progress indicator
+        if (isUploading) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Add Transcript", fontSize = 12.sp)
+                Column(modifier = Modifier.padding(12.dp)) {
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("upload_progress_indicator")
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = uploadStatusMessage ?: "Processing with Gemini...",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
             }
         }
 
-        if (isUploading) {
-            Spacer(modifier = Modifier.height(10.dp))
-            LinearProgressIndicator(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("upload_progress_indicator")
-            )
-            Text(
-                text = uploadStatusMessage ?: "Extracting text with Gemini & preserving accents...",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.padding(top = 4.dp)
-            )
+        // Upload success message banner
+        if (!isUploading && uploadStatusMessage != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = uploadStatusMessage ?: "",
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                    IconButton(
+                        onClick = { viewModel.clearUploadStatus() },
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Dismiss", modifier = Modifier.size(14.dp))
+                    }
+                }
+            }
+        }
+
+        // Upload error banner
+        if (uploadErrorMessage != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Error, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = uploadErrorMessage ?: "An error occurred",
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                    }
+                    IconButton(
+                        onClick = { viewModel.clearUploadStatus() },
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Dismiss", modifier = Modifier.size(14.dp))
+                    }
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
@@ -219,18 +441,80 @@ fun DocumentsScreen(
             )
             AssistChip(
                 onClick = { /* Grounding status */ },
-                label = { Text("Source-Grounded", fontSize = 11.sp) },
+                label = {
+                    Text(
+                        if (documents.isNotEmpty()) "Source-Grounded" else "No Materials Yet",
+                        fontSize = 11.sp
+                    )
+                },
                 leadingIcon = {
-                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(14.dp))
+                    Icon(
+                        imageVector = if (documents.isNotEmpty()) Icons.Default.CheckCircle else Icons.Default.Info,
+                        contentDescription = null,
+                        tint = if (documents.isNotEmpty()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.size(14.dp)
+                    )
                 }
             )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Filter documents list
+        // Chapter Organization Filter Chips
+        ScrollableTabRow(
+            selectedTabIndex = if (selectedChapterFilter == "ALL") 0 else (chapters.indexOfFirst { it.id == selectedChapterFilter } + 1).coerceAtLeast(0),
+            edgePadding = 0.dp,
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+            modifier = Modifier.clip(RoundedCornerShape(10.dp))
+        ) {
+            Tab(
+                selected = selectedChapterFilter == "ALL",
+                onClick = { selectedChapterFilter = "ALL" },
+                text = { Text("All (${documents.size})", fontSize = 11.sp, fontWeight = if (selectedChapterFilter == "ALL") FontWeight.Bold else FontWeight.Normal) }
+            )
+            chapters.forEach { ch ->
+                val count = documents.count { it.chapterId == ch.id }
+                Tab(
+                    selected = selectedChapterFilter == ch.id,
+                    onClick = {
+                        selectedChapterFilter = ch.id
+                        targetUploadChapterId = ch.id
+                    },
+                    text = { Text("Ch. ${ch.number} ($count)", fontSize = 11.sp, fontWeight = if (selectedChapterFilter == ch.id) FontWeight.Bold else FontWeight.Normal) }
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Source Type Filter Chips
+        val sources = listOf("ALL", "Textbook Photo", "Textbook PDF", "Lecture Audio", "Pasted Notes")
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            items(sources) { src ->
+                val isSelected = selectedSourceFilter == src
+                val label = if (src == "ALL") "All Sources" else src
+                FilterChip(
+                    selected = isSelected,
+                    onClick = { selectedSourceFilter = src },
+                    label = { Text(label, fontSize = 11.sp) },
+                    leadingIcon = if (isSelected) {
+                        { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(12.dp)) }
+                    } else null
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Filter documents list by search, chapter, and source
         val filteredDocs = documents.filter { doc ->
-            (searchQuery.isBlank() || doc.title.contains(searchQuery, ignoreCase = true) || doc.contentText.contains(searchQuery, ignoreCase = true))
+            val matchesQuery = (searchQuery.isBlank() || doc.title.contains(searchQuery, ignoreCase = true) || doc.contentText.contains(searchQuery, ignoreCase = true))
+            val matchesChapter = (selectedChapterFilter == "ALL" || doc.chapterId == selectedChapterFilter)
+            val matchesSource = (selectedSourceFilter == "ALL" || doc.sourceTypeName.equals(selectedSourceFilter, ignoreCase = true))
+            matchesQuery && matchesChapter && matchesSource
         }
 
         LazyColumn(
@@ -238,15 +522,48 @@ fun DocumentsScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = PaddingValues(bottom = 24.dp)
         ) {
-            items(filteredDocs, key = { it.id }) { doc ->
-                DocumentCard(
-                    document = doc,
-                    onViewClick = { viewingDoc = doc },
-                    onListenClick = {
-                        val firstFrench = doc.contentText.lines().find { it.contains(":") || it.contains("-") } ?: doc.title
-                        viewModel.speakFrench(firstFrench.take(100))
+            if (filteredDocs.isEmpty()) {
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth().padding(top = 16.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(Icons.Default.MenuBook, contentDescription = null, tint = MaterialTheme.colorScheme.outline, modifier = Modifier.size(36.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = if (searchQuery.isNotBlank()) "No matching documents found." else "No documents in this view.",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Scan textbook pages, upload lecture MP3s, or paste notes using the buttons above.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
                     }
-                )
+                }
+            } else {
+                items(filteredDocs, key = { it.id }) { doc ->
+                    DocumentCard(
+                        document = doc,
+                        onViewClick = { viewingDoc = doc },
+                        onEditClick = { editingDoc = doc },
+                        onListenClick = {
+                            val firstFrench = doc.contentText.lines().find { it.contains(":") || it.contains("-") } ?: doc.title
+                            viewModel.speakFrench(firstFrench.take(100))
+                        },
+                        onDeleteClick = {
+                            showDeleteConfirmDialog = doc
+                        }
+                    )
+                }
             }
         }
     }
@@ -327,19 +644,47 @@ fun DocumentsScreen(
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         TextButton(
                             onClick = {
-                                viewModel.speakFrench(doc.contentText.take(250))
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                val clip = android.content.ClipData.newPlainText("Course Document", doc.contentText)
+                                clipboard.setPrimaryClip(clip)
+                                Toast.makeText(context, "Copied content to clipboard", Toast.LENGTH_SHORT).show()
                             }
                         ) {
-                            Icon(Icons.Default.VolumeUp, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Hear Pronunciation")
+                            Text("Copy", fontSize = 12.sp)
                         }
-                        Button(onClick = { viewingDoc = null }) {
-                            Text("Done")
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedButton(
+                                onClick = {
+                                    val toEdit = doc
+                                    viewingDoc = null
+                                    editingDoc = toEdit
+                                }
+                            ) {
+                                Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Edit Mistakes", fontSize = 12.sp)
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            TextButton(
+                                onClick = {
+                                    viewModel.speakFrench(doc.contentText.take(250))
+                                }
+                            ) {
+                                Icon(Icons.Default.VolumeUp, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Pronounce")
+                            }
+                            Button(onClick = { viewingDoc = null }) {
+                                Text("Done")
+                            }
                         }
                     }
                 }
@@ -347,73 +692,30 @@ fun DocumentsScreen(
         }
     }
 
-    // Lecture Audio / Notes input dialog
-    if (showLectureUploadDialog) {
-        var lectureTitle by remember { mutableStateOf("Oct 14 Class Lecture") }
-        var lectureNotes by remember {
-            mutableStateOf(
-                "[00:08:15] PROFESSOR: Remember this for the exam! When conjugating -er verbs like parler and aimer, the endings -e, -es, -ent are completely silent! Don't pronounce the 'ent'."
-            )
-        }
-
-        Dialog(onDismissRequest = { showLectureUploadDialog = false }) {
-            Surface(
-                shape = RoundedCornerShape(18.dp),
-                color = MaterialTheme.colorScheme.surface,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(18.dp)) {
-                    Text(
-                        text = "Upload Lecture Recording / Notes",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "AI will transcribe, detect explicit professor test warnings, and index timestamps.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    OutlinedTextField(
-                        value = lectureTitle,
-                        onValueChange = { lectureTitle = it },
-                        label = { Text("Lecture Title / Recording Name") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    OutlinedTextField(
-                        value = lectureNotes,
-                        onValueChange = { lectureNotes = it },
-                        label = { Text("Transcript / Audio Notes / Timestamped Audio") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(120.dp)
-                    )
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        TextButton(onClick = { showLectureUploadDialog = false }) {
-                            Text("Cancel")
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Button(
-                            onClick = {
-                                viewModel.uploadLectureTranscript(lectureNotes, "$lectureTitle.m4a")
-                                showLectureUploadDialog = false
-                            },
-                            modifier = Modifier.testTag("submit_lecture_btn")
-                        ) {
-                            Text("Process & Index")
-                        }
-                    }
+    // Delete confirmation dialog
+    showDeleteConfirmDialog?.let { docToDelete ->
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirmDialog = null },
+            title = { Text("Delete Document?") },
+            text = { Text("Are you sure you want to remove '${docToDelete.title}' from your course library?") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.deleteDocument(docToDelete)
+                        showDeleteConfirmDialog = null
+                        Toast.makeText(context, "Document deleted", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirmDialog = null }) {
+                    Text("Cancel")
                 }
             }
-        }
+        )
     }
 
     // Paste Text / Handout / Notes Dialog
@@ -492,7 +794,11 @@ fun DocumentsScreen(
                         Button(
                             onClick = {
                                 if (pastedBody.isNotBlank()) {
-                                    viewModel.savePastedCourseNotes(pastedTitle, pastedBody)
+                                    viewModel.savePastedCourseNotes(
+                                        title = pastedTitle,
+                                        content = pastedBody,
+                                        targetChapterId = targetUploadChapterId
+                                    )
                                     showPasteNotesDialog = false
                                     Toast.makeText(context, "Notes added to study sources!", Toast.LENGTH_SHORT).show()
                                 }
@@ -507,13 +813,110 @@ fun DocumentsScreen(
             }
         }
     }
+
+    // Editing Document Dialog for correcting mistakes
+    editingDoc?.let { docToEdit ->
+        EditDocumentDialog(
+            document = docToEdit,
+            chapters = chapters,
+            onDismiss = { editingDoc = null },
+            onSave = { updated ->
+                viewModel.updateCourseDocument(updated)
+                editingDoc = null
+                Toast.makeText(context, "Corrections saved & knowledge base updated!", Toast.LENGTH_SHORT).show()
+            }
+        )
+    }
+
+    // Target Chapter Picker Dialog
+    if (showTargetChapterPicker) {
+        AlertDialog(
+            onDismissRequest = { showTargetChapterPicker = false },
+            title = { Text("Select Target Chapter for Uploads") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "New textbook scans, audio recordings, or pasted notes will be indexed into the selected chapter:",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    chapters.forEach { ch ->
+                        OutlinedCard(
+                            onClick = {
+                                targetUploadChapterId = ch.id
+                                showTargetChapterPicker = false
+                            },
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = if (targetUploadChapterId == ch.id) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surface
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "Ch. ${ch.number}: ${ch.title}",
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontWeight = if (targetUploadChapterId == ch.id) FontWeight.Bold else FontWeight.Normal
+                                ),
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showTargetChapterPicker = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+}
+
+fun decodeBitmapFromUri(context: Context, uri: Uri, maxDimension: Int = 1920): Bitmap? {
+    return try {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, options)
+        }
+        val maxSide = maxOf(options.outWidth, options.outHeight)
+        var sampleSize = 1
+        while (maxSide / (sampleSize * 2) >= maxDimension) {
+            sampleSize *= 2
+        }
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, decodeOptions)
+        }
+    } catch (e: Exception) {
+        Log.e("DocumentsScreen", "Error decoding bitmap from URI", e)
+        null
+    }
+}
+
+fun getFileNameFromUri(context: Context, uri: Uri, defaultPrefix: String = "textbook_page_"): String {
+    var name = "$defaultPrefix${System.currentTimeMillis()}.jpg"
+    try {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor: Cursor ->
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (nameIndex != -1 && cursor.moveToFirst()) {
+                val found = cursor.getString(nameIndex)
+                if (!found.isNullOrBlank()) name = found
+            }
+        }
+    } catch (e: Exception) {
+        Log.e("DocumentsScreen", "Error getting file name", e)
+    }
+    return name
 }
 
 @Composable
 fun DocumentCard(
     document: CourseDocumentEntity,
     onViewClick: () -> Unit,
+    onEditClick: () -> Unit,
     onListenClick: () -> Unit,
+    onDeleteClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -552,11 +955,20 @@ fun DocumentCard(
                     )
                 }
 
-                Text(
-                    text = document.pageOrTimestamp,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = document.pageOrTimestamp,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    IconButton(
+                        onClick = onDeleteClick,
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(Icons.Default.DeleteOutline, contentDescription = "Delete", tint = MaterialTheme.colorScheme.outline, modifier = Modifier.size(16.dp))
+                    }
+                }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
@@ -601,7 +1013,18 @@ fun DocumentCard(
                     style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                     color = MaterialTheme.colorScheme.outline
                 )
-                Row {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onEditClick,
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "Edit or correct extraction",
+                            tint = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                     IconButton(
                         onClick = onListenClick,
                         modifier = Modifier.size(32.dp)
@@ -615,6 +1038,211 @@ fun DocumentCard(
                     }
                     TextButton(onClick = onViewClick) {
                         Text("View Source", fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun EditDocumentDialog(
+    document: CourseDocumentEntity,
+    chapters: List<ChapterEntity>,
+    onDismiss: () -> Unit,
+    onSave: (CourseDocumentEntity) -> Unit
+) {
+    var title by remember { mutableStateOf(document.title) }
+    var chapterId by remember { mutableStateOf(document.chapterId) }
+    var pageOrTimestamp by remember { mutableStateOf(document.pageOrTimestamp) }
+    var contentText by remember { mutableStateOf(document.contentText) }
+    var isProfessorEmphasis by remember { mutableStateOf(document.isProfessorEmphasis) }
+    var professorGuidance by remember { mutableStateOf(document.professorGuidance) }
+    var expandedChapterDropdown by remember { mutableStateOf(false) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = MaterialTheme.colorScheme.surface,
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(18.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Correct Extraction Mistakes",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "Edit French accents, misread text, or reassign chapter",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "Close")
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    item {
+                        OutlinedTextField(
+                            value = title,
+                            onValueChange = { title = it },
+                            label = { Text("Document Title") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    item {
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            val curChap = chapters.find { it.id == chapterId }
+                            OutlinedCard(
+                                onClick = { expandedChapterDropdown = true },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text(
+                                            text = "Assigned Chapter",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.outline
+                                        )
+                                        Text(
+                                            text = curChap?.let { "Ch. ${it.number}: ${it.title}" } ?: "Select Chapter",
+                                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
+                                        )
+                                    }
+                                    Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                                }
+                            }
+
+                            DropdownMenu(
+                                expanded = expandedChapterDropdown,
+                                onDismissRequest = { expandedChapterDropdown = false }
+                            ) {
+                                chapters.forEach { ch ->
+                                    DropdownMenuItem(
+                                        text = { Text("Ch. ${ch.number}: ${ch.title}") },
+                                        onClick = {
+                                            chapterId = ch.id
+                                            expandedChapterDropdown = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    item {
+                        OutlinedTextField(
+                            value = pageOrTimestamp,
+                            onValueChange = { pageOrTimestamp = it },
+                            label = { Text("Page or Timestamp (e.g. Page 29 or 00:14:30)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { isProfessorEmphasis = !isProfessorEmphasis }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = isProfessorEmphasis,
+                                onCheckedChange = { isProfessorEmphasis = it }
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "⭐ Professor Test Warning / Guidance Included",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
+                            )
+                        }
+                    }
+
+                    if (isProfessorEmphasis) {
+                        item {
+                            OutlinedTextField(
+                                value = professorGuidance,
+                                onValueChange = { professorGuidance = it },
+                                label = { Text("Professor's Explicit Test Advice") },
+                                placeholder = { Text("e.g. Exam warning: Know être conjugations") },
+                                singleLine = false,
+                                maxLines = 3,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+
+                    item {
+                        Text(
+                            text = "Extracted Course Text (Preserve accents & tables):",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        OutlinedTextField(
+                            value = contentText,
+                            onValueChange = { contentText = it },
+                            placeholder = { Text("Extracted text with French accents...") },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 180.dp, max = 320.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(onClick = onDismiss) {
+                        Text("Cancel")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            val updated = document.copy(
+                                title = title.trim().ifEmpty { document.title },
+                                chapterId = chapterId,
+                                pageOrTimestamp = pageOrTimestamp.trim().ifEmpty { document.pageOrTimestamp },
+                                contentText = contentText,
+                                isProfessorEmphasis = isProfessorEmphasis,
+                                professorGuidance = if (isProfessorEmphasis) professorGuidance.trim() else ""
+                            )
+                            onSave(updated)
+                        }
+                    ) {
+                        Text("Save Corrections")
                     }
                 }
             }

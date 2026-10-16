@@ -10,8 +10,6 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,6 +40,7 @@ fun TranslateScreen(
 ) {
     val context = LocalContext.current
     val isListening by viewModel.speechEngine.isListening.collectAsState()
+    val isContinuousMode by viewModel.speechEngine.isContinuousMode.collectAsState()
     val liveTranscript by viewModel.speechEngine.liveTranscript.collectAsState()
     val livePhrases by viewModel.liveTranscripts.collectAsState()
 
@@ -51,19 +50,22 @@ fun TranslateScreen(
     var selectedDirection by remember { mutableStateOf("Auto-Detect (English ⇄ French)") }
     var directionMenuExpanded by remember { mutableStateOf(false) }
 
-    // Displayed Translation & Language Detection State
-    var detectedLanguage by remember { mutableStateOf("French") }
-    var targetLanguage by remember { mutableStateOf("English") }
-    var currentSpoken by remember { mutableStateOf("Bonjour, comment allez-vous ?") }
-    var currentTranslated by remember { mutableStateOf("Hello, how are you?") }
-    var currentPhonetics by remember { mutableStateOf("Koh-mahn tah-lay VOO") }
+    // Displayed Translation & Language Detection State (Starts clean, NO fake examples!)
+    var detectedLanguage by remember { mutableStateOf("Auto") }
+    var targetLanguage by remember { mutableStateOf("French") }
+    var currentSpoken by remember { mutableStateOf("") }
+    var currentTranslated by remember { mutableStateOf("") }
+    var currentPhonetics by remember { mutableStateOf("") }
     var currentExplanation by remember { mutableStateOf("") }
-    var currentAlternatives by remember { mutableStateOf(listOf("Comment vas-tu ? (Informal to friend)", "Ça va ? (Casual: How's it going?)")) }
+    var currentAlternatives by remember { mutableStateOf<List<String>>(emptyList()) }
+    var currentErrorMessage by remember { mutableStateOf<String?>(null) }
+    var isTranslatingText by remember { mutableStateOf(false) }
 
     // Sync live transcript changes into display
     LaunchedEffect(liveTranscript) {
         if (liveTranscript.isNotBlank()) {
             currentSpoken = liveTranscript
+            currentErrorMessage = null
             viewModel.handleLiveSpeech(liveTranscript)
         }
     }
@@ -78,6 +80,7 @@ fun TranslateScreen(
             currentPhonetics = latest.phonetics
             currentAlternatives = latest.alternatives
             currentExplanation = latest.explanation
+            currentErrorMessage = latest.errorMessage
         }
     }
 
@@ -138,15 +141,15 @@ fun TranslateScreen(
                         color = MaterialTheme.colorScheme.outline
                     )
                     Text(
-                        text = if (isListening) "Listening..." else "Microphone off",
-                        style = MaterialTheme.typography.bodySmall,
+                        text = if (isListening) "Listening continuous..." else if (isContinuousMode) "Paused" else "Microphone off",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
                         color = if (isListening) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                     )
                 }
 
                 Spacer(modifier = Modifier.height(18.dp))
 
-                // Big Purple Microphone Button
+                // Big Purple Microphone Button with pulse
                 Box(
                     modifier = Modifier.fillMaxWidth(),
                     contentAlignment = Alignment.Center
@@ -179,7 +182,7 @@ fun TranslateScreen(
                             .size(76.dp)
                             .scale(pulseScale)
                             .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary)
+                            .background(if (isListening) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.primary.copy(alpha = 0.9f))
                             .testTag("tap_to_listen_btn")
                     ) {
                         Icon(
@@ -263,19 +266,31 @@ fun TranslateScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Action Buttons: Pause, Stop, Clear
+                // Action Buttons: Pause, Resume, Stop, Clear
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    OutlinedButton(
-                        onClick = { viewModel.stopLiveListening() },
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("pause_listening_btn")
-                    ) {
-                        Text("Pause", fontSize = 13.sp)
+                    if (isListening) {
+                        OutlinedButton(
+                            onClick = { viewModel.pauseLiveListening() },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("pause_listening_btn")
+                        ) {
+                            Text("Pause", fontSize = 13.sp)
+                        }
+                    } else if (isContinuousMode) {
+                        Button(
+                            onClick = { viewModel.resumeLiveListening() },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("resume_listening_btn")
+                        ) {
+                            Text("Resume", fontSize = 13.sp)
+                        }
                     }
 
                     OutlinedButton(
@@ -295,6 +310,7 @@ fun TranslateScreen(
                             currentTranslated = ""
                             currentPhonetics = ""
                             currentAlternatives = emptyList()
+                            currentErrorMessage = null
                         },
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier
@@ -338,7 +354,10 @@ fun TranslateScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "🌐 Detected: $detectedLanguage ➔ Translating to: $targetLanguage",
+                            text = if (detectedLanguage != "Auto")
+                                "🌐 Detected: $detectedLanguage ➔ Translating to: $targetLanguage"
+                            else
+                                "🌐 Auto-Detect: English ⇄ French",
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onPrimaryContainer
                         )
@@ -353,248 +372,320 @@ fun TranslateScreen(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // Section 1: WHAT WAS SPOKEN / HEARD
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "WHAT I HEARD ($detectedLanguage)",
-                        style = MaterialTheme.typography.labelMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 1.sp
-                        ),
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                    Row {
-                        IconButton(
-                            onClick = {
-                                val loc = if (detectedLanguage == "English") Locale.ENGLISH else Locale.FRENCH
-                                viewModel.speechEngine.speak(currentSpoken, locale = loc)
-                            },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(Icons.Default.VolumeUp, contentDescription = "Hear input", modifier = Modifier.size(18.dp))
-                        }
-                        Spacer(modifier = Modifier.width(4.dp))
-                        OutlinedButton(
-                            onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboard.setPrimaryClip(ClipData.newPlainText("Spoken Text", currentSpoken))
-                                Toast.makeText(context, "Copied spoken text", Toast.LENGTH_SHORT).show()
-                            },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.testTag("copy_spoken_btn")
-                        ) {
-                            Text("Copy", fontSize = 12.sp)
+                if (currentSpoken.isBlank() && currentTranslated.isBlank() && currentErrorMessage == null) {
+                    // Friendly prompt state when nothing has been spoken/typed yet
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 16.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                Icons.Default.Translate,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.outline.copy(alpha = 0.7f),
+                                modifier = Modifier.size(32.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Speak into the microphone or type below",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = "Translations, pronunciation, and alternative options appear here.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline
+                            )
                         }
                     }
-                }
+                } else {
+                    // Section 1: WHAT WAS SPOKEN / HEARD
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "WHAT I HEARD (${detectedLanguage.ifEmpty { "Input" }})",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 1.sp
+                            ),
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Row {
+                            IconButton(
+                                onClick = {
+                                    if (detectedLanguage == "English") {
+                                        viewModel.speakEnglish(currentSpoken)
+                                    } else {
+                                        viewModel.speakFrench(currentSpoken)
+                                    }
+                                },
+                                enabled = currentSpoken.isNotBlank(),
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(Icons.Default.VolumeUp, contentDescription = "Hear input", modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            TextButton(
+                                onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("Input", currentSpoken))
+                                    Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                                },
+                                enabled = currentSpoken.isNotBlank(),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text("Copy", fontSize = 12.sp)
+                            }
+                        }
+                    }
 
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = currentSpoken.ifEmpty { "Waiting for speech..." },
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Medium
-                    ),
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-
-                Spacer(modifier = Modifier.height(14.dp))
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                Spacer(modifier = Modifier.height(14.dp))
-
-                // Section 2: WHAT IT MEANS / HOW TO SAY IT
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "TRANSLATION ($targetLanguage)",
-                        style = MaterialTheme.typography.labelMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 1.sp
+                        text = currentSpoken.ifEmpty { "Listening..." },
+                        style = MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp),
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    Spacer(modifier = Modifier.height(14.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Section 2: TRANSLATION
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "TRANSLATION ($targetLanguage)",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 1.sp
+                            ),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Row {
+                            IconButton(
+                                onClick = {
+                                    if (targetLanguage == "English") {
+                                        viewModel.speakEnglish(currentTranslated)
+                                    } else {
+                                        viewModel.speakFrench(currentTranslated)
+                                    }
+                                },
+                                enabled = currentTranslated.isNotBlank(),
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(Icons.Default.VolumeUp, contentDescription = "Hear translation", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("Translation", currentTranslated))
+                                    Toast.makeText(context, "Translation copied", Toast.LENGTH_SHORT).show()
+                                },
+                                enabled = currentTranslated.isNotBlank(),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.testTag("copy_translated_btn")
+                            ) {
+                                Text("Copy", fontSize = 12.sp)
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = currentTranslated.ifEmpty { "Translation will appear here..." },
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.Bold
                         ),
                         color = MaterialTheme.colorScheme.primary
                     )
-                    Row {
-                        IconButton(
-                            onClick = {
-                                val loc = if (targetLanguage == "French") Locale.FRENCH else Locale.ENGLISH
-                                viewModel.speechEngine.speak(currentTranslated, locale = loc)
-                            },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(Icons.Default.VolumeUp, contentDescription = "Hear translation", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-                        }
-                        Spacer(modifier = Modifier.width(4.dp))
-                        OutlinedButton(
-                            onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboard.setPrimaryClip(ClipData.newPlainText("Translation", currentTranslated))
-                                Toast.makeText(context, "Copied translation", Toast.LENGTH_SHORT).show()
-                            },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+
+                    if (currentErrorMessage != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
                             shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.testTag("copy_translated_btn")
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("Copy", fontSize = 12.sp)
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = currentTranslated.ifEmpty { "Translation will appear here..." },
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontSize = 19.sp,
-                        fontWeight = FontWeight.Bold
-                    ),
-                    color = MaterialTheme.colorScheme.primary
-                )
-
-                if (currentPhonetics.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                Icons.Default.RecordVoiceOver,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.secondary,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "Phonetic: $currentPhonetics",
-                                style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                color = MaterialTheme.colorScheme.onSecondaryContainer
-                            )
-                        }
-                    }
-                }
-
-                if (currentExplanation.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = currentExplanation,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(10.dp)
-                        )
-                    }
-                }
-
-                // Section 3: ALTERNATIVE OPTIONS & OTHER WAYS TO SAY THIS
-                if (currentAlternatives.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(14.dp))
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Text(
-                        text = "OPTIONS & OTHER WAYS TO SAY THIS:",
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 1.sp),
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        currentAlternatives.forEach { alt ->
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                                modifier = Modifier.fillMaxWidth()
+                            Row(
+                                modifier = Modifier.padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
+                                Text(
+                                    text = currentErrorMessage ?: "Error",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(
+                                    onClick = {
+                                        if (currentSpoken.isNotBlank()) {
+                                            viewModel.handleLiveSpeech(currentSpoken)
+                                        }
+                                    }
                                 ) {
-                                    Text(
-                                        text = alt,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    IconButton(
-                                        onClick = {
-                                            val cleanPhrase = alt.substringBefore("(").trim()
-                                            viewModel.speakFrench(cleanPhrase)
-                                        },
-                                        modifier = Modifier.size(24.dp)
+                                    Text("Retry", color = MaterialTheme.colorScheme.error)
+                                }
+                            }
+                        }
+                    }
+
+                    if (currentPhonetics.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.RecordVoiceOver,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.secondary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Phonetic: $currentPhonetics",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                                )
+                            }
+                        }
+                    }
+
+                    if (currentExplanation.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = currentExplanation,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+
+                    // Section 3: ALTERNATIVE OPTIONS & OTHER WAYS TO SAY THIS
+                    if (currentAlternatives.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        Text(
+                            text = "OPTIONS & OTHER WAYS TO SAY THIS:",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 1.sp),
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            currentAlternatives.forEach { alt ->
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Icon(
-                                            Icons.Default.VolumeUp,
-                                            contentDescription = "Hear option",
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(16.dp)
+                                        Text(
+                                            text = alt,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.weight(1f)
                                         )
+                                        IconButton(
+                                            onClick = {
+                                                val cleanPhrase = alt.substringBefore("(").trim()
+                                                if (targetLanguage == "French") {
+                                                    viewModel.speakFrench(cleanPhrase)
+                                                } else {
+                                                    viewModel.speakEnglish(cleanPhrase)
+                                                }
+                                            },
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Default.VolumeUp,
+                                                contentDescription = "Hear option",
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
 
-                // Action Buttons: Hear & Save phrase
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            val targetWord = if (targetLanguage == "French") currentTranslated else currentSpoken
-                            viewModel.speakFrench(targetWord)
-                        },
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("hear_french_btn")
+                    // Action Buttons: Hear & Save phrase
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Hear French", fontSize = 13.sp)
-                    }
+                        OutlinedButton(
+                            onClick = {
+                                val targetWord = if (targetLanguage == "French") currentTranslated else currentSpoken
+                                viewModel.speakFrench(targetWord)
+                            },
+                            enabled = currentTranslated.isNotBlank() || currentSpoken.isNotBlank(),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("hear_french_btn")
+                        ) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Hear French", fontSize = 13.sp)
+                        }
 
-                    OutlinedButton(
-                        onClick = {
-                            val f = if (targetLanguage == "French") currentTranslated else currentSpoken
-                            val e = if (targetLanguage == "English") currentTranslated else currentSpoken
-                            viewModel.saveBookmark(
-                                title = "Saved Translation",
-                                french = f,
-                                english = e,
-                                category = "Translation"
-                            )
-                            Toast.makeText(context, "Phrase saved to Study list!", Toast.LENGTH_SHORT).show()
-                        },
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("save_phrase_btn")
-                    ) {
-                        Icon(Icons.Default.BookmarkBorder, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Save phrase", fontSize = 13.sp)
+                        OutlinedButton(
+                            onClick = {
+                                val f = if (targetLanguage == "French") currentTranslated else currentSpoken
+                                val e = if (targetLanguage == "English") currentTranslated else currentSpoken
+                                viewModel.saveBookmark(
+                                    title = "Saved Translation",
+                                    french = f,
+                                    english = e,
+                                    category = "Translation"
+                                )
+                                Toast.makeText(context, "Phrase saved to Study list!", Toast.LENGTH_SHORT).show()
+                            },
+                            enabled = currentTranslated.isNotBlank() || currentSpoken.isNotBlank(),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("save_phrase_btn")
+                        ) {
+                            Icon(Icons.Default.BookmarkBorder, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save phrase", fontSize = 13.sp)
+                        }
                     }
                 }
             }
@@ -670,8 +761,10 @@ fun TranslateScreen(
 
                     Button(
                         onClick = {
-                            if (inputText.isNotBlank()) {
+                            if (inputText.isNotBlank() && !isTranslatingText) {
+                                isTranslatingText = true
                                 viewModel.translateText(inputText, addExplanation) { result ->
+                                    isTranslatingText = false
                                     detectedLanguage = result.detectedLanguage
                                     targetLanguage = result.targetLanguage
                                     currentSpoken = if (result.detectedLanguage == "English") result.englishText else result.frenchText
@@ -679,12 +772,18 @@ fun TranslateScreen(
                                     currentPhonetics = result.phoneticText
                                     currentAlternatives = result.alternatives
                                     currentExplanation = result.explanation
+                                    currentErrorMessage = result.errorMessage
                                 }
                             }
                         },
+                        enabled = inputText.isNotBlank() && !isTranslatingText,
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.testTag("translate_submit_btn")
                     ) {
+                        if (isTranslatingText) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White)
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
                         Text("Translate →", fontWeight = FontWeight.Bold)
                     }
                 }
@@ -725,6 +824,7 @@ fun TranslateScreen(
                             clipboard.setPrimaryClip(ClipData.newPlainText("Transcript", fullText))
                             Toast.makeText(context, "Copied all transcript phrases", Toast.LENGTH_SHORT).show()
                         },
+                        enabled = livePhrases.isNotEmpty(),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.testTag("copy_all_transcript_btn")
