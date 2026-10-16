@@ -1,0 +1,6 @@
+{
+  "name": "French Study Companion",
+  "description": "AI-powered French tutor, textbook study assistant, lecture note generator, live translator, pronunciation coach, and adaptive exam preparation tool.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Open Book Left Page (Warm Cream) -->
+    <path
+        android:fillColor="#FFF8E7"
+        android:pathData="M52,38 C42,35 32,36 26,38 C24.9,38.4 24,39.4 24,40.6 L24,69.5 C24,71 25.4,72.2 26.9,71.8 C32.5,70.2 42,69.5 52,72.5 Z" />
+
+    <!-- Open Book Right Page (Warm Cream) -->
+    <path
+        android:fillColor="#F6EDDA"
+        android:pathData="M56,38 C66,35 76,36 82,38 C83.1,38.4 84,39.4 84,40.6 L84,69.5 C84,71 82.6,72.2 81.1,71.8 C75.5,70.2 66,69.5 56,72.5 Z" />
+
+    <!-- Book Spine / Center Shadow -->
+    <path
+        android:fillColor="#E2D4BC"
+        android:pathData="M52,38 L56,38 L56,72.5 L52,72.5 Z" />
+
+    <!-- French Tricolor Bookmark Ribbon -->
+    <!-- Blue band -->
+    <path
+        android:fillColor="#3B5998"
+        android:pathData="M51,34 L53,34 L53,52 L51,50 Z" />
+    <!-- White band -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M53,34 L55,34 L55,54 L53,52 Z" />
+    <!-- Red band -->
+    <path
+        android:fillColor="#D9383A"
+        android:pathData="M55,34 L57,34 L57,56 L55,54 Z" />
+
+    <!-- Text line hints on Left Page -->
+    <path
+        android:fillColor="#D4C5A9"
+        android:pathData="M30,46 L47,46 C47.5,46 48,46.5 48,47 C48,47.5 47.5,48 47,48 L30,48 C29.5,48 29,47.5 29,47 C29,46.5 29.5,46 30,46 Z" />
+    <path
+        android:fillColor="#D4C5A9"
+        android:pathData="M30,52 L47,52 C47.5,52 48,52.5 48,53 C48,53.5 47.5,54 47,54 L30,54 C29.5,54 29,53.5 29,53 C29,52.5 29.5,52 30,52 Z" />
+    <path
+        android:fillColor="#D4C5A9"
+        android:pathData="M30,58 L42,58 C42.5,58 43,58.5 43,59 C43,59.5 42.5,60 42,60 L30,60 C29.5,60 29,59.5 29,59 C29,58.5 29.5,58 30,58 Z" />
+
+    <!-- Text line hints on Right Page -->
+    <path
+        android:fillColor="#D4C5A9"
+        android:pathData="M61,46 L78,46 C78.5,46 79,46.5 79,47 C79,47.5 78.5,48 78,48 L61,48 C60.5,48 60,47.5 60,47 C60,46.5 60.5,46 61,46 Z" />
+    <path
+        android:fillColor="#D4C5A9"
+        android:pathData="M61,52 L78,52 C78.5,52 79,52.5 79,53 C79,53.5 78.5,54 78,54 L61,54 C60.5,54 60,53.5 60,53 C60,52.5 60.5,52 61,52 Z" />
+    <path
+        android:fillColor="#D4C5A9"
+        android:pathData="M61,58 L73,58 C73.5,58 74,58.5 74,59 C74,59.5 73.5,60 73,60 L61,60 C60.5,60 60,59.5 60,59 C60,58.5 60.5,58 61,58 Z" />
+
+    <!-- Gold Academic Star / Sparkle above book -->
+    <path
+        android:fillColor="#FFD166"
+        android:pathData="M54,23 L55.5,27.5 L60,29 L55.5,30.5 L54,35 L52.5,30.5 L48,29 L52.5,27.5 Z" />
+</vector>
